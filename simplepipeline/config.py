@@ -38,6 +38,8 @@ class _ConfiguredFunction:
     trigger_product: str | None = None
     interval: timedelta | None = None
     start_at: datetime | None = None
+    sensor_directory: Path | None = None
+    product_factory: Callable[[Path], Product] | None = None
 
 
 def _parse_timestamp(value: str, setting: str) -> datetime:
@@ -66,6 +68,39 @@ def _load_processor(reference: str, config_directory: Path) -> Processor:
     if not callable(processor):
         raise ValueError(f"processor {reference!r} does not identify a callable")
     return processor
+
+
+def _load_product_factory(
+    reference: str, config_directory: Path
+) -> Callable[[Path], Product]:
+    try:
+        module_name, function_name = reference.split(":", maxsplit=1)
+    except ValueError as error:
+        raise ValueError(
+            "product_factory must use the 'module:function' format: "
+            f"{reference!r}"
+        ) from error
+    if not module_name or not function_name:
+        raise ValueError(f"invalid product factory reference: {reference!r}")
+    directory = str(config_directory)
+    if directory not in sys.path:
+        sys.path.insert(0, directory)
+    module = importlib.import_module(module_name)
+    factory = getattr(module, function_name, None)
+    if not callable(factory):
+        raise ValueError(
+            f"product factory {reference!r} does not identify a callable"
+        )
+
+    def create_product(path: Path) -> Product:
+        product = factory(path)
+        if not isinstance(product, Product):
+            raise TypeError(
+                f"product factory {reference!r} must return a Product"
+            )
+        return product
+
+    return create_product
 
 
 def _make_single_rule(
@@ -155,6 +190,8 @@ class ConfigWorker:
         if not isinstance(functions, dict) or not functions:
             raise ValueError("configuration must define at least one [functions.<name>] table")
         self.functions: list[_ConfiguredFunction] = []
+        self._sensor_observations: dict[tuple[str, str], tuple[int, int]] = {}
+        self._sensor_registered_paths: set[tuple[str, str]] = set()
         for name, function_settings in functions.items():
             if not isinstance(function_settings, dict):
                 raise ValueError(f"function {name!r} must be a TOML table")
@@ -209,9 +246,43 @@ class ConfigWorker:
                         start_at=start_at,
                     )
                 )
+            elif cadence_type == "sensor":
+                directory_setting = cadence.get("directory")
+                factory_reference = cadence.get("product_factory")
+                if not isinstance(directory_setting, str) or not directory_setting:
+                    raise ValueError(
+                        f"function {name!r} sensor cadence requires a directory"
+                    )
+                if not isinstance(factory_reference, str):
+                    raise ValueError(
+                        f"function {name!r} sensor cadence requires "
+                        "product_factory = 'module:function'"
+                    )
+                directory = Path(directory_setting).expanduser()
+                if not directory.is_absolute():
+                    directory = self.config_path.parent / directory
+                trigger_product = cadence.get("product", rule.input_product_codes[0])
+                if trigger_product not in rule.input_product_codes:
+                    raise ValueError(
+                        f"function {name!r} sensor trigger product must be listed in inputs"
+                    )
+                self.functions.append(
+                    _ConfiguredFunction(
+                        rule,
+                        processor,
+                        cadence_type,
+                        output_version=output_version,
+                        trigger_product=trigger_product,
+                        sensor_directory=directory.resolve(),
+                        product_factory=_load_product_factory(
+                            factory_reference, self.config_path.parent
+                        ),
+                    )
+                )
             else:
                 raise ValueError(
-                    f"function {name!r} cadence.type must be 'interval' or 'on_input'"
+                    f"function {name!r} cadence.type must be 'interval', "
+                    "'on_input', or 'sensor'"
                 )
 
         self.pipeline = Pipeline(self.database)
@@ -225,7 +296,29 @@ class ConfigWorker:
         for function in self.functions:
             rule = function.rule
             candidate_times = set(self.pipeline.incomplete_candidates(rule.name))
-            if function.cadence_type == "on_input":
+            if function.cadence_type == "sensor":
+                assert function.sensor_directory is not None
+                assert function.product_factory is not None
+                if not function.sensor_directory.is_dir():
+                    raise NotADirectoryError(
+                        f"sensor directory does not exist: {function.sensor_directory}"
+                    )
+                for path in sorted(function.sensor_directory.iterdir()):
+                    if not path.is_file():
+                        continue
+                    key = (rule.name, str(path))
+                    if key in self._sensor_registered_paths:
+                        continue
+                    stat = path.stat()
+                    signature = (stat.st_size, stat.st_mtime_ns)
+                    if self._sensor_observations.get(key) != signature:
+                        self._sensor_observations[key] = signature
+                        continue
+                    product = function.product_factory(path)
+                    self.pipeline.add_product(product)
+                    self._sensor_registered_paths.add(key)
+
+            if function.cadence_type in ("on_input", "sensor"):
                 assert function.trigger_product is not None
                 candidate_times.update(
                     self.pipeline.product_timestamps(

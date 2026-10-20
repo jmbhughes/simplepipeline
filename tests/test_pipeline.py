@@ -420,6 +420,53 @@ product = "L1"
     ]
 
 
+def test_sensor_cadence_registers_stable_files(tmp_path, monkeypatch):
+    calls = []
+    processor_module = types.ModuleType("sensor_processors")
+    processor_module.process = lambda inputs, output_time: (
+        calls.append((inputs, output_time)) or "/products/output.fits"
+    )
+    processor_module.product_from_path = lambda path: Product(
+        "L1", END, str(path)
+    )
+    monkeypatch.setitem(sys.modules, "sensor_processors", processor_module)
+    sensor_directory = tmp_path / "incoming"
+    sensor_directory.mkdir()
+    incoming_file = sensor_directory / "new-file.dat"
+    incoming_file.write_text("complete input")
+
+    config_path = tmp_path / "pipeline.toml"
+    config_path.write_text(
+        f'''[worker]
+database = "worker.sqlite3"
+
+[functions.sensor_l2]
+output = "L2"
+processor = "sensor_processors:process"
+
+[[functions.sensor_l2.rules]]
+type = "same_timestamp"
+inputs = ["L1"]
+
+[functions.sensor_l2.cadence]
+type = "sensor"
+directory = "{sensor_directory}"
+product_factory = "sensor_processors:product_from_path"
+'''
+    )
+
+    worker = ConfigWorker(config_path)
+    pipeline = Pipeline(tmp_path / "worker.sqlite3")
+    assert worker.run_once(END) == {}
+    assert pipeline.products("L1") == []
+
+    assert worker.run_once(END) == {("sensor_l2", END): "complete"}
+    assert [product.path for product in pipeline.products("L1")] == [
+        str(incoming_file)
+    ]
+    assert len(calls) == 1
+
+
 def test_config_worker_runs_processor_in_a_separate_process(tmp_path):
     (tmp_path / "processor.py").write_text(
         "def process(inputs, output_time):\n"

@@ -18,10 +18,10 @@ without enough inputs are retried on later polls.
 ## Configuration-driven worker
 
 Pipeline functions, product codes, processor references, and cadence can be
-declared in TOML. The worker polls registered products in SQLite for input
-triggers, or runs candidates on a fixed interval. Register discovered files
-with `Pipeline.add_product`; the worker uses their product codes and timestamps
-to find work.
+declared in TOML. The worker can poll registered products for input triggers,
+schedule candidates at fixed intervals, or register stable files detected in a
+sensor directory. The sensor's `product_factory` maps each detected path to a
+`Product`; the worker then uses its product code and timestamp to find work.
 
 ```sh
 python -m simplepipeline pipeline.toml
@@ -57,6 +57,24 @@ Each function requires a `[functions.<name>.cadence]` table. The `type` can be:
   type = "interval"
   every_seconds = 86400
   start_at = "2026-10-17T00:00:00Z"
+  ```
+
+- **`sensor`**: watch the immediate contents of a directory for files. Set
+  `directory` to the directory path (relative paths are resolved from the
+  configuration file) and `product_factory` to a `module:function` reference.
+  The factory is called with each stable file's `Path` and must return a
+  `Product` containing its product code, timestamp, path, and optional version.
+  A file is registered after its size and modification time remain unchanged
+  across consecutive polls. The optional `product` selects which registered
+  input code triggers candidates; it must be listed in the function's rule
+  inputs and defaults to the first input code. For example:
+
+  ```toml
+  [functions.l2.cadence]
+  type = "sensor"
+  directory = "incoming"
+  product_factory = "my_processing:product_from_path"
+  product = "L1"
   ```
 
 Cadence determines candidate output timestamps; rules determine which inputs
@@ -98,7 +116,7 @@ precedence and is used only to break ties deterministically. Generated outputs
 use `output_version` from TOML or the `run_candidate` keyword argument, defaulting
 to `0.0.0`. Interval candidates are anchored at `start_at`; missed intervals are
 scheduled on restart, and the next interval cursor is persisted in SQLite.
-Incomplete candidates are retried each poll for either cadence. The worker uses
+Incomplete candidates are retried each poll for every cadence. The worker uses
 Python's `spawn` mode and runs until stopped with Ctrl+C.
 
 The existing programmatic `DailyWorker` API remains available for daily
