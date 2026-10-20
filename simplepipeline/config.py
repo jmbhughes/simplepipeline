@@ -22,7 +22,7 @@ from .models import (
     normalize_timestamp,
     semantic_version_key,
 )
-from .rules import EvenlyDistributedWindowRule, SameTimestampRule
+from .rules import CompositeRule, EvenlyDistributedWindowRule, SameTimestampRule
 
 
 LOGGER = logging.getLogger(__name__)
@@ -68,18 +68,19 @@ def _load_processor(reference: str, config_directory: Path) -> Processor:
     return processor
 
 
-def _make_rule(name: str, settings: dict) -> ScheduledRule:
-    input_codes = settings.get("inputs")
-    output_code = settings.get("output")
-    rule_type = settings.get("rule")
+def _make_single_rule(
+    name: str,
+    rule_settings: dict,
+    rule_type: str,
+    output_code: str,
+) -> ScheduledRule:
+    input_codes = rule_settings.get("inputs")
     if (
         not isinstance(input_codes, list)
         or not input_codes
         or not all(isinstance(code, str) for code in input_codes)
     ):
-        raise ValueError(f"function {name!r} must declare a non-empty inputs array")
-    if not isinstance(output_code, str):
-        raise ValueError(f"function {name!r} must declare an output product code")
+        raise ValueError(f"function {name!r} rule must declare a non-empty inputs array")
     if rule_type == "same_timestamp":
         return SameTimestampRule(name, input_codes, output_code)
     if rule_type == "evenly_distributed_window":
@@ -88,8 +89,8 @@ def _make_rule(name: str, settings: dict) -> ScheduledRule:
                 f"function {name!r}: evenly_distributed_window requires exactly one input"
             )
         try:
-            window = timedelta(seconds=float(settings["window_seconds"]))
-            count = int(settings["count"])
+            window = timedelta(seconds=float(rule_settings["window_seconds"]))
+            count = int(rule_settings["count"])
         except (KeyError, TypeError, ValueError) as error:
             raise ValueError(
                 f"function {name!r} requires window_seconds and count"
@@ -101,6 +102,26 @@ def _make_rule(name: str, settings: dict) -> ScheduledRule:
         f"function {name!r} has unsupported rule {rule_type!r}; "
         "use 'same_timestamp' or 'evenly_distributed_window'"
     )
+
+
+def _make_rule(name: str, settings: dict) -> ScheduledRule:
+    output_code = settings.get("output")
+    if not isinstance(output_code, str):
+        raise ValueError(f"function {name!r} must declare an output product code")
+    if "rules" not in settings:
+        return _make_single_rule(name, settings, settings.get("rule"), output_code)
+
+    rule_settings = settings["rules"]
+    if not isinstance(rule_settings, list) or not rule_settings:
+        raise ValueError(f"function {name!r} must declare a non-empty rules array")
+    rules = []
+    for index, item in enumerate(rule_settings):
+        if not isinstance(item, dict):
+            raise ValueError(f"function {name!r} rule {index + 1} must be a table")
+        rules.append(
+            _make_single_rule(name, item, item.get("type"), output_code)
+        )
+    return CompositeRule(name, rules)
 
 
 class ConfigWorker:

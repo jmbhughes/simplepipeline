@@ -4,11 +4,19 @@ poll_interval_seconds = 30
 claim_timeout_seconds = 86400
 
 [functions.l2]
-inputs = ["L1"]
 output = "L2"
-rule = "same_timestamp"
 processor = "demo:make_l2"
 output_version = "0.0.0"
+
+[[functions.l2.rules]]
+type = "same_timestamp"
+inputs = ["L1"]
+
+[[functions.l2.rules]]
+type = "evenly_distributed_window"
+inputs = ["L1B"]
+window_seconds = 604800
+count = 100
 
 [functions.l2.cadence]
 type = "on_input"

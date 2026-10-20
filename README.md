@@ -34,18 +34,52 @@ timestamp, writes the output, and returns its path. Processor references use
 `module:function`; the module must be importable from the configuration
 directory or Python environment.
 
-An interval-scheduled function uses an ISO-8601 UTC start time and a fixed
-period. For example:
+Each function requires a `[functions.<name>.cadence]` table. The `type` can be:
+
+- **`on_input`**: schedule a candidate whenever a product of a listed input
+  code is registered. The optional `product` selects which input code triggers
+  candidates; it must appear in that function's rule inputs. If omitted, the
+  first input product code is used. For example:
+
+  ```toml
+  [functions.l2.cadence]
+  type = "on_input"
+  product = "L1"
+  ```
+
+- **`interval`**: schedule candidates on a fixed interval starting at
+  `start_at`. Set `every_seconds` to a positive number of seconds and `start_at`
+  to a timezone-aware ISO-8601 timestamp (UTC recommended). The start time is
+  included; missed intervals are scheduled after a restart. For example:
+
+  ```toml
+  [functions.daily_l2.cadence]
+  type = "interval"
+  every_seconds = 86400
+  start_at = "2026-10-17T00:00:00Z"
+  ```
+
+Cadence determines candidate output timestamps; rules determine which inputs
+are required for each candidate. All rules must select their inputs before the
+processor runs. For example, this interval-scheduled function requires an L1
+product at each candidate timestamp and 100 evenly distributed L1B products
+from the preceding week:
 
 ```toml
 [functions.daily_l2]
-inputs = ["L1"]
 output = "L2"
-rule = "evenly_distributed_window"
-window_seconds = 604800
-count = 100
 processor = "my_processing:make_l2"
 output_version = "1.2.0"
+
+[[functions.daily_l2.rules]]
+type = "same_timestamp"
+inputs = ["L1"]
+
+[[functions.daily_l2.rules]]
+type = "evenly_distributed_window"
+inputs = ["L1B"]
+window_seconds = 604800
+count = 100
 
 [functions.daily_l2.cadence]
 type = "interval"
@@ -53,17 +87,19 @@ every_seconds = 86400
 start_at = "2026-10-17T00:00:00Z"
 ```
 
-`same_timestamp` rules can require multiple input product codes at a matching
-timestamp. `evenly_distributed_window` currently accepts one input product
-code. When registering files, pass `version="1.2.0"` to `Product`; the chooser
+The existing single-rule configuration (`rule`, `inputs`, and any rule-specific
+settings directly under the function) remains supported. `same_timestamp` rules
+can require multiple input product codes at a matching timestamp, while
+`evenly_distributed_window` accepts one input product code. When registering
+files, pass `version="1.2.0"` to `Product`; the chooser
 ignores older versions for that product code, even if an older-version file has
 a timestamp that the newest version does not. Build metadata follows SemVer
 precedence and is used only to break ties deterministically. Generated outputs
 use `output_version` from TOML or the `run_candidate` keyword argument, defaulting
 to `0.0.0`. Interval candidates are anchored at `start_at`; missed intervals are
 scheduled on restart, and the next interval cursor is persisted in SQLite.
-Incomplete candidates are retried each poll. The worker uses Python's `spawn`
-mode and runs until stopped with Ctrl+C.
+Incomplete candidates are retried each poll for either cadence. The worker uses
+Python's `spawn` mode and runs until stopped with Ctrl+C.
 
 The existing programmatic `DailyWorker` API remains available for daily
 midnight-UTC schedules. Its processing claim expires after one day by default;

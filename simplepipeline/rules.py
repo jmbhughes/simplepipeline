@@ -6,6 +6,7 @@ from typing import Sequence
 from .models import (
     Product,
     Rule,
+    ScheduledRule,
     latest_version_products,
     normalize_timestamp,
     validate_product_code,
@@ -115,3 +116,59 @@ class EvenlyDistributedWindowRule(Rule):
             selected.append(eligible[best_index])
             used.add(best_index)
         return sorted(selected, key=lambda p: (p.timestamp, p.path, p.product_id or 0))
+
+
+class CompositeRule:
+    """Require the selected inputs from each child rule."""
+
+    def __init__(self, name: str, rules: Sequence[ScheduledRule]) -> None:
+        if not name or not name.strip():
+            raise ValueError("rule name cannot be empty")
+        if not rules:
+            raise ValueError("at least one rule is required")
+        output_codes = {rule.output_product_code for rule in rules}
+        if len(output_codes) != 1:
+            raise ValueError("all rules must produce the same output product code")
+
+        self.name = name
+        self.rules = tuple(rules)
+        self.output_product_code = rules[0].output_product_code
+        self._input_product_codes = tuple(
+            dict.fromkeys(
+                code for rule in rules for code in rule.input_product_codes
+            )
+        )
+
+    @property
+    def input_product_code(self) -> str:
+        return self._input_product_codes[0]
+
+    @property
+    def input_product_codes(self) -> tuple[str, ...]:
+        return self._input_product_codes
+
+    def select_inputs(
+        self, candidates: Sequence[Product], output_timestamp: datetime
+    ) -> list[Product]:
+        selected: list[Product] = []
+        seen: set[tuple[str, ...]] = set()
+        for rule in self.rules:
+            rule_inputs = rule.select_inputs(candidates, output_timestamp)
+            if not rule_inputs:
+                return []
+            for product in rule_inputs:
+                identity = (
+                    ("id", str(product.product_id))
+                    if product.product_id is not None
+                    else (
+                        "product",
+                        product.product_code,
+                        product.timestamp.isoformat(),
+                        product.path,
+                        product.version,
+                    )
+                )
+                if identity not in seen:
+                    selected.append(product)
+                    seen.add(identity)
+        return selected

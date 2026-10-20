@@ -366,6 +366,60 @@ def test_config_worker_runs_and_persists_fixed_interval_schedule(tmp_path, monke
     assert ConfigWorker(config_path).run_once(END) == {}
 
 
+def test_config_worker_combines_multiple_rules(tmp_path, monkeypatch):
+    calls = []
+    processor_module = types.ModuleType("test_processors")
+    processor_module.process = lambda inputs, output_time: (
+        calls.append(inputs) or "/products/output.fits"
+    )
+    monkeypatch.setitem(sys.modules, "test_processors", processor_module)
+    config_path = tmp_path / "pipeline.toml"
+    config_path.write_text(
+        '''[worker]
+database = "worker.sqlite3"
+
+[functions.combine]
+output = "L2"
+processor = "test_processors:process"
+
+[[functions.combine.rules]]
+type = "same_timestamp"
+inputs = ["L1"]
+
+[[functions.combine.rules]]
+type = "evenly_distributed_window"
+inputs = ["L1B"]
+window_seconds = 10
+count = 2
+
+[functions.combine.cadence]
+type = "on_input"
+product = "L1"
+'''
+    )
+    worker = ConfigWorker(config_path)
+    pipeline = Pipeline(tmp_path / "worker.sqlite3")
+    pipeline.add_product(Product("L1", END, "/inputs/l1"))
+
+    assert worker.run_once(END) == {("combine", END): "pending"}
+    pipeline.add_product(Product("L1B", END - timedelta(seconds=9), "/inputs/l1b-early"))
+    pipeline.add_product(Product("L1B", END - timedelta(seconds=1), "/inputs/l1b-late"))
+
+    assert worker.run_once(END) == {("combine", END): "complete"}
+    assert [[product.path for product in inputs] for inputs in calls] == [[
+        "/inputs/l1",
+        "/inputs/l1b-early",
+        "/inputs/l1b-late",
+    ]]
+    assert [
+        product.path for product in pipeline.candidate_inputs("combine", END)
+    ] == [
+        "/inputs/l1",
+        "/inputs/l1b-early",
+        "/inputs/l1b-late",
+    ]
+
+
 def test_config_worker_runs_processor_in_a_separate_process(tmp_path):
     (tmp_path / "processor.py").write_text(
         "def process(inputs, output_time):\n"
