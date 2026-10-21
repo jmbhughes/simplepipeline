@@ -574,7 +574,8 @@ def test_config_worker_process_handles_keyboard_interrupt(monkeypatch):
     _run_config_process("unused.toml", None)
 
 
-def test_dashboard_serves_recent_pipeline_status(tmp_path):
+def test_dashboard_serves_recent_pipeline_status(tmp_path, caplog):
+    caplog.set_level("DEBUG", logger="simplepipeline.dashboard")
     pipeline = Pipeline(tmp_path / "pipeline.sqlite3")
     rule = SameTimestampRule("combine", "L1", "L2")
     pipeline.run_candidate(rule, END - timedelta(seconds=1), _worker_processor)
@@ -605,3 +606,4 @@ def test_dashboard_serves_recent_pipeline_status(tmp_path):
     assert [item["attempts"] for item in status["candidates"]] == [1, 0]
     assert status["products"][0]["product_code"] == "L2"
     assert "<title>simplepipeline dashboard</title>" in page
+    assert "/api/status" not in caplog.text

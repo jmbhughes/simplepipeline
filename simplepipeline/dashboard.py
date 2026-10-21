@@ -178,6 +178,8 @@ class DashboardServer:
                 self.wfile.write(body)
 
             def log_message(self, format: str, *args: object) -> None:
+                if self.command == "GET" and self.path == "/api/status":
+                    return
                 LOGGER.debug("Dashboard: " + format, *args)
 
         self._server = ThreadingHTTPServer((host, port), DashboardHandler)
