@@ -52,11 +52,16 @@ def _write_config(
     cadence,
     processor="test_processors:process",
     output_version="0.0.0",
+    max_workers=None,
 ):
+    max_workers_setting = (
+        "" if max_workers is None else f"max_workers = {max_workers}\n"
+    )
     path.write_text(
         f'''[worker]
 database = "worker.sqlite3"
 poll_interval_seconds = 1
+{max_workers_setting}
 
 [functions.combine]
 inputs = ["L1", "L1B"]
@@ -690,6 +695,28 @@ def test_config_worker_runs_processor_in_a_separate_process(tmp_path):
     assert worker.join(timeout=0) == 0
 
 
+def test_config_worker_starts_configured_number_of_processes(tmp_path):
+    (tmp_path / "processor.py").write_text(
+        "def process(inputs, output_time):\n"
+        "    return f'/products/{output_time:%Y%m%dT%H%M%SZ}.fits'\n"
+    )
+    config_path = tmp_path / "pipeline.toml"
+    _write_config(
+        config_path,
+        cadence='type = "on_input"\nproduct = "L1"',
+        processor="processor:process",
+        max_workers=2,
+    )
+    worker = ConfigWorker(config_path)
+    assert worker.max_workers == 2
+
+    worker.start()
+    assert len(worker._processes) == 2
+    assert all(process.is_alive() for process in worker._processes)
+    assert worker.stop(timeout=5)
+    assert worker.join(timeout=0) == 0
+
+
 def test_config_worker_process_handles_keyboard_interrupt(monkeypatch):
     def interrupt(self, stop_event):
         raise KeyboardInterrupt
@@ -1277,6 +1304,8 @@ def test_rule_configuration_validation(settings, message):
             "database",
         ),
         ('[worker]\nmax_attempts = 0\n' + _base_config_text(), "max_attempts"),
+        ('[worker]\nmax_workers = 0\n' + _base_config_text(), "max_workers"),
+        ('[worker]\nmax_workers = true\n' + _base_config_text(), "max_workers"),
         (
             '[worker]\npoll_interval_seconds = 0\n' + _base_config_text(),
             "poll_interval_seconds",

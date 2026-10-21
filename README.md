@@ -32,6 +32,7 @@ Configure the retry limit in the TOML `[worker]` table:
 ```toml
 [worker]
 max_attempts = 3
+max_workers = 2
 ```
 
 `max_attempts` is the maximum total number of processing attempts for a
@@ -41,6 +42,13 @@ that reaches the limit remains marked `failed` with its latest error, and is no
 longer retried. Candidates waiting for required inputs do not consume attempts.
 An expired processing claim does consume an attempt; if the limit has already
 been reached, the candidate is marked failed once the claim expires.
+
+`max_workers` is the maximum number of worker processes started by this
+configuration. It must be a positive integer and defaults to `1`. Additional
+workers can process different candidates concurrently; SQLite claims prevent
+them from processing the same candidate at the same time. Configure processors
+to be safe when invoked concurrently, and account for the extra CPU and memory
+use.
 
 The worker logs startup, sensor-file registration, completed candidates, and
 failures to the terminal. Add `--verbose` to include debug messages such as

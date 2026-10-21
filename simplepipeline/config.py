@@ -192,12 +192,19 @@ class ConfigWorker:
             seconds=float(worker_settings.get("claim_timeout_seconds", 86400))
         )
         self.max_attempts = worker_settings.get("max_attempts", 3)
+        self.max_workers = worker_settings.get("max_workers", 1)
         if (
             isinstance(self.max_attempts, bool)
             or not isinstance(self.max_attempts, int)
             or self.max_attempts <= 0
         ):
             raise ValueError("worker.max_attempts must be a positive integer")
+        if (
+            isinstance(self.max_workers, bool)
+            or not isinstance(self.max_workers, int)
+            or self.max_workers <= 0
+        ):
+            raise ValueError("worker.max_workers must be a positive integer")
         if self.poll_interval <= 0:
             raise ValueError("worker.poll_interval_seconds must be positive")
         if self.claim_timeout <= timedelta(0):
@@ -317,7 +324,7 @@ class ConfigWorker:
                 )
 
         self.pipeline = Pipeline(self.database)
-        self._process: multiprocessing.Process | None = None
+        self._processes: list[multiprocessing.Process] = []
         self._stop_event = None
         LOGGER.info(
             "Loaded %d pipeline function(s) from %s using database %s",
@@ -462,35 +469,64 @@ class ConfigWorker:
                 return
 
     def start(self) -> None:
-        """Start the configured worker in a separate process."""
-        if self._process is not None and self._process.is_alive():
+        """Start the configured worker processes."""
+        if any(process.is_alive() for process in self._processes):
             raise RuntimeError("worker is already running")
         context = multiprocessing.get_context("spawn")
         self._stop_event = context.Event()
-        self._process = context.Process(
-            target=_run_config_process,
-            args=(str(self.config_path), self._stop_event),
-            name="simplepipeline-config-worker",
-        )
-        self._process.start()
-        LOGGER.info("Started worker process (pid %s)", self._process.pid)
+        self._processes = []
+        try:
+            for worker_number in range(1, self.max_workers + 1):
+                process = context.Process(
+                    target=_run_config_process,
+                    args=(str(self.config_path), self._stop_event),
+                    name=f"simplepipeline-config-worker-{worker_number}",
+                )
+                process.start()
+                self._processes.append(process)
+                LOGGER.info(
+                    "Started worker process %s/%s (pid %s)",
+                    worker_number,
+                    self.max_workers,
+                    process.pid,
+                )
+        except Exception:
+            self._stop_event.set()
+            for process in self._processes:
+                process.join()
+            raise
 
     def stop(self, timeout: float | None = None) -> bool:
-        """Request a graceful stop and return whether the process stopped."""
-        if self._process is None or self._stop_event is None:
+        """Request a graceful stop and return whether all processes stopped."""
+        if not self._processes or self._stop_event is None:
             return True
         self._stop_event.set()
-        self._process.join(timeout)
-        if not self._process.is_alive():
-            LOGGER.info("Worker process stopped (exit code %s)", self._process.exitcode)
-        return not self._process.is_alive()
+        deadline = None if timeout is None else time.monotonic() + timeout
+        for process in self._processes:
+            remaining = (
+                None if deadline is None else max(0, deadline - time.monotonic())
+            )
+            process.join(remaining)
+            if not process.is_alive():
+                LOGGER.info("Worker process stopped (exit code %s)", process.exitcode)
+        return not any(process.is_alive() for process in self._processes)
 
     def join(self, timeout: float | None = None) -> int | None:
-        """Wait for the worker and return its exit code when available."""
-        if self._process is None:
+        """Wait for all worker processes and return their combined exit status."""
+        if not self._processes:
             raise RuntimeError("worker has not been started")
-        self._process.join(timeout)
-        return self._process.exitcode
+        deadline = None if timeout is None else time.monotonic() + timeout
+        for process in self._processes:
+            remaining = (
+                None if deadline is None else max(0, deadline - time.monotonic())
+            )
+            process.join(remaining)
+        if any(process.is_alive() for process in self._processes):
+            return None
+        return next(
+            (process.exitcode for process in self._processes if process.exitcode),
+            0,
+        )
 
 
 def _run_config_process(config_path: str, stop_event) -> None:
