@@ -105,7 +105,9 @@ Each function requires a `[functions.<name>.cadence]` table. The `type` can be:
   A file is registered after its size and modification time remain unchanged
   across consecutive polls. Registered file paths are remembered in the
   pipeline database, so restarting the worker does not register the same file
-  again. The optional `product` selects which registered
+  again. Set the optional `extension` to only consider filenames ending with
+  that extension (case-insensitively); for example, `.fits` ignores metadata
+  files such as `.DS_Store`. The optional `product` selects which registered
   input code triggers candidates; it must be listed in the function's rule
   inputs and defaults to the first input code. For example:
 
@@ -114,6 +116,7 @@ Each function requires a `[functions.<name>.cadence]` table. The `type` can be:
   type = "sensor"
   directory = "incoming"
   product_factory = "my_processing:product_from_path"
+  extension = ".fits"
   product = "L1"
   ```
 
@@ -148,8 +151,13 @@ start_at = "2026-10-17T00:00:00Z"
 The existing single-rule configuration (`rule`, `inputs`, and any rule-specific
 settings directly under the function) remains supported. `same_timestamp` rules
 can require multiple input product codes at a matching timestamp, while
-`evenly_distributed_window` accepts one input product code. When registering
-files, pass `version="1.2.0"` to `Product`; the chooser
+`evenly_distributed_window` and `random_distributed_window` each accept one
+input product code plus a `window_seconds` and `count`. The evenly distributed
+rule chooses inputs near evenly spaced points in the window; the random rule
+chooses a random sample from all eligible inputs. Both use the interval
+`[output timestamp - window_seconds, output timestamp)`, and remain pending
+until at least `count` eligible inputs are available. When registering files,
+pass `version="1.2.0"` to `Product`; the chooser
 ignores older versions for that product code, even if an older-version file has
 a timestamp that the newest version does not. Build metadata follows SemVer
 precedence and is used only to break ties deterministically. Generated outputs

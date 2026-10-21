@@ -22,7 +22,12 @@ from .models import (
     normalize_timestamp,
     semantic_version_key,
 )
-from .rules import CompositeRule, EvenlyDistributedWindowRule, SameTimestampRule
+from .rules import (
+    CompositeRule,
+    EvenlyDistributedWindowRule,
+    RandomDistributedWindowRule,
+    SameTimestampRule,
+)
 
 
 LOGGER = logging.getLogger(__name__)
@@ -39,6 +44,7 @@ class _ConfiguredFunction:
     interval: timedelta | None = None
     start_at: datetime | None = None
     sensor_directory: Path | None = None
+    sensor_extension: str | None = None
     product_factory: Callable[[Path], Product] | None = None
 
 
@@ -118,10 +124,10 @@ def _make_single_rule(
         raise ValueError(f"function {name!r} rule must declare a non-empty inputs array")
     if rule_type == "same_timestamp":
         return SameTimestampRule(name, input_codes, output_code)
-    if rule_type == "evenly_distributed_window":
+    if rule_type in ("evenly_distributed_window", "random_distributed_window"):
         if len(input_codes) != 1:
             raise ValueError(
-                f"function {name!r}: evenly_distributed_window requires exactly one input"
+                f"function {name!r}: {rule_type} requires exactly one input"
             )
         try:
             window = timedelta(seconds=float(rule_settings["window_seconds"]))
@@ -130,12 +136,16 @@ def _make_single_rule(
             raise ValueError(
                 f"function {name!r} requires window_seconds and count"
             ) from error
-        return EvenlyDistributedWindowRule(
-            name, input_codes[0], output_code, window=window, count=count
+        rule_class = (
+            EvenlyDistributedWindowRule
+            if rule_type == "evenly_distributed_window"
+            else RandomDistributedWindowRule
         )
+        return rule_class(name, input_codes[0], output_code, window=window, count=count)
     raise ValueError(
         f"function {name!r} has unsupported rule {rule_type!r}; "
-        "use 'same_timestamp' or 'evenly_distributed_window'"
+        "use 'same_timestamp', 'evenly_distributed_window', "
+        "or 'random_distributed_window'"
     )
 
 
@@ -256,6 +266,7 @@ class ConfigWorker:
             elif cadence_type == "sensor":
                 directory_setting = cadence.get("directory")
                 factory_reference = cadence.get("product_factory")
+                extension = cadence.get("extension")
                 if not isinstance(directory_setting, str) or not directory_setting:
                     raise ValueError(
                         f"function {name!r} sensor cadence requires a directory"
@@ -264,6 +275,18 @@ class ConfigWorker:
                     raise ValueError(
                         f"function {name!r} sensor cadence requires "
                         "product_factory = 'module:function'"
+                    )
+                if extension is not None and (
+                    not isinstance(extension, str)
+                    or len(extension) < 2
+                    or not extension.startswith(".")
+                    or extension.strip() != extension
+                    or "/" in extension
+                    or "\\" in extension
+                ):
+                    raise ValueError(
+                        f"function {name!r} sensor extension must be a filename "
+                        "extension beginning with '.'"
                     )
                 directory = Path(directory_setting).expanduser()
                 if not directory.is_absolute():
@@ -281,6 +304,7 @@ class ConfigWorker:
                         output_version=output_version,
                         trigger_product=trigger_product,
                         sensor_directory=directory.resolve(),
+                        sensor_extension=extension,
                         product_factory=_load_product_factory(
                             factory_reference, self.config_path.parent
                         ),
@@ -326,6 +350,13 @@ class ConfigWorker:
                 }
                 for path in sorted(function.sensor_directory.iterdir()):
                     if not path.is_file():
+                        continue
+                    if (
+                        function.sensor_extension is not None
+                        and not path.name.lower().endswith(
+                            function.sensor_extension.lower()
+                        )
+                    ):
                         continue
                     key = (rule.name, str(path))
                     if key in self._sensor_registered_paths:

@@ -17,12 +17,14 @@ from simplepipeline import (
     EvenlyDistributedWindowRule,
     Pipeline,
     Product,
+    RandomDistributedWindowRule,
 )
 from simplepipeline.config import _run_config_process
 from simplepipeline.dashboard import DashboardServer
 from simplepipeline.engine import daily_utc_candidates
 from simplepipeline.models import semantic_version_key
 from simplepipeline.rules import SameTimestampRule
+import simplepipeline.rules as rules_module
 
 
 UTC = timezone.utc
@@ -120,6 +122,40 @@ def test_week_window_is_start_inclusive_end_exclusive(tmp_path):
     pipeline.add_product(Product("L1", END - timedelta(days=7), "/inputs/start"))
     pipeline.add_product(Product("L1", END, "/inputs/end"))
     assert pipeline.run_candidate(rule, END, lambda inputs, _: "/output") == "pending"
+
+
+def test_random_distributed_window_samples_eligible_latest_version_products(
+    monkeypatch,
+):
+    rule = RandomDistributedWindowRule(
+        "random-window", "L1", "L2", window=timedelta(days=7), count=2
+    )
+    candidates = [
+        Product("L1", END - timedelta(days=7), "/inputs/start", version="2.0.0"),
+        Product("L1", END - timedelta(days=3), "/inputs/middle-old", version="1.0.0"),
+        Product("L1", END - timedelta(days=3), "/inputs/middle-new", version="2.0.0"),
+        Product("L1", END, "/inputs/end"),
+        Product("L1B", END - timedelta(days=1), "/inputs/other-code"),
+    ]
+    sampled = []
+
+    def sample(population, count):
+        sampled.append((population, count))
+        return [population[-1], population[0]]
+
+    monkeypatch.setattr(rules_module.random, "sample", sample)
+    selected = rule.select_inputs(candidates, END)
+
+    assert sampled[0][1] == 2
+    assert [product.path for product in sampled[0][0]] == [
+        "/inputs/start",
+        "/inputs/middle-new",
+    ]
+    assert [product.path for product in selected] == [
+        "/inputs/start",
+        "/inputs/middle-new",
+    ]
+    assert rule.select_inputs(candidates[:1], END) == []
 
 
 def test_pipeline_stops_retrying_after_max_attempts(tmp_path):
@@ -494,6 +530,45 @@ product = "L1"
     ]
 
 
+def test_config_worker_supports_random_distributed_window(tmp_path, monkeypatch):
+    calls = []
+    processor_module = types.ModuleType("random_processors")
+    processor_module.process = lambda inputs, output_time: (
+        calls.append(inputs) or "/products/output.fits"
+    )
+    monkeypatch.setitem(sys.modules, "random_processors", processor_module)
+    config_path = tmp_path / "pipeline.toml"
+    config_path.write_text(
+        '''[worker]
+database = "worker.sqlite3"
+
+[functions.random]
+inputs = ["L1"]
+output = "L2"
+rule = "random_distributed_window"
+window_seconds = 604800
+count = 2
+processor = "random_processors:process"
+
+[functions.random.cadence]
+type = "interval"
+every_seconds = 86400
+start_at = "2026-10-16T00:00:00Z"
+'''
+    )
+    worker = ConfigWorker(config_path)
+    pipeline = Pipeline(tmp_path / "worker.sqlite3")
+    for day in (1, 2, 3):
+        pipeline.add_product(
+            Product("L1", END - timedelta(days=day), f"/inputs/{day}")
+        )
+
+    assert worker.run_once(END) == {("random", END): "complete"}
+    assert len(calls) == 1
+    assert len(calls[0]) == 2
+    assert all(product.product_code == "L1" for product in calls[0])
+
+
 def test_sensor_cadence_registers_stable_files(tmp_path, monkeypatch):
     calls = []
     factory_calls = []
@@ -512,6 +587,8 @@ def test_sensor_cadence_registers_stable_files(tmp_path, monkeypatch):
     sensor_directory.mkdir()
     incoming_file = sensor_directory / "new-file.dat"
     incoming_file.write_text("complete input")
+    (sensor_directory / ".DS_Store").write_text("metadata")
+    (sensor_directory / "ignore.txt").write_text("not a product")
 
     config_path = tmp_path / "pipeline.toml"
     config_path.write_text(
@@ -530,6 +607,7 @@ inputs = ["L1"]
 type = "sensor"
 directory = "{sensor_directory}"
 product_factory = "sensor_processors:product_from_path"
+extension = ".dat"
 '''
     )
 

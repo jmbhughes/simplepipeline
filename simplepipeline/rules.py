@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import random
 from datetime import datetime, timedelta
 from typing import Sequence
 
@@ -116,6 +117,56 @@ class EvenlyDistributedWindowRule(Rule):
             selected.append(eligible[best_index])
             used.add(best_index)
         return sorted(selected, key=lambda p: (p.timestamp, p.path, p.product_id or 0))
+
+
+class RandomDistributedWindowRule(Rule):
+    """Select a random sample of exactly N inputs from [T-window, T)."""
+
+    def __init__(
+        self,
+        name: str,
+        input_product_code: str,
+        output_product_code: str,
+        *,
+        window: timedelta,
+        count: int,
+    ) -> None:
+        super().__init__(name, input_product_code, output_product_code)
+        if window <= timedelta(0):
+            raise ValueError("window must be positive")
+        if count <= 0:
+            raise ValueError("count must be positive")
+        self.window = window
+        self.count = count
+
+    def select_inputs(
+        self, candidates: Sequence[Product], output_timestamp: datetime
+    ) -> list[Product]:
+        end = normalize_timestamp(output_timestamp)
+        start = end - self.window
+        eligible = sorted(
+            (
+                product
+                for product in latest_version_products(candidates)
+                if product.product_code == self.input_product_code
+                and start <= product.timestamp < end
+            ),
+            key=lambda product: (
+                product.timestamp,
+                product.path,
+                product.product_id or 0,
+            ),
+        )
+        if len(eligible) < self.count:
+            return []
+        return sorted(
+            random.sample(eligible, self.count),
+            key=lambda product: (
+                product.timestamp,
+                product.path,
+                product.product_id or 0,
+            ),
+        )
 
 
 class CompositeRule:
