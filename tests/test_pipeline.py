@@ -494,13 +494,17 @@ product = "L1"
 
 def test_sensor_cadence_registers_stable_files(tmp_path, monkeypatch):
     calls = []
+    factory_calls = []
     processor_module = types.ModuleType("sensor_processors")
     processor_module.process = lambda inputs, output_time: (
         calls.append((inputs, output_time)) or "/products/output.fits"
     )
-    processor_module.product_from_path = lambda path: Product(
-        "L1", END, str(path)
-    )
+
+    def product_from_path(path):
+        factory_calls.append(path)
+        return Product("L1", END, str(path))
+
+    processor_module.product_from_path = product_from_path
     monkeypatch.setitem(sys.modules, "sensor_processors", processor_module)
     sensor_directory = tmp_path / "incoming"
     sensor_directory.mkdir()
@@ -537,6 +541,12 @@ product_factory = "sensor_processors:product_from_path"
         str(incoming_file)
     ]
     assert len(calls) == 1
+    assert factory_calls == [incoming_file]
+
+    restarted_worker = ConfigWorker(config_path)
+    assert restarted_worker.run_once(END) == {}
+    assert restarted_worker.run_once(END) == {}
+    assert factory_calls == [incoming_file]
 
 
 def test_config_worker_runs_processor_in_a_separate_process(tmp_path):

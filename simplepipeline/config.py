@@ -320,11 +320,18 @@ class ConfigWorker:
                     raise NotADirectoryError(
                         f"sensor directory does not exist: {function.sensor_directory}"
                     )
+                registered_paths = {
+                    Path(product.path).expanduser().resolve()
+                    for product in self.pipeline.products()
+                }
                 for path in sorted(function.sensor_directory.iterdir()):
                     if not path.is_file():
                         continue
                     key = (rule.name, str(path))
                     if key in self._sensor_registered_paths:
+                        continue
+                    if path.resolve() in registered_paths:
+                        self._sensor_registered_paths.add(key)
                         continue
                     stat = path.stat()
                     signature = (stat.st_size, stat.st_mtime_ns)

@@ -100,7 +100,9 @@ Each function requires a `[functions.<name>.cadence]` table. The `type` can be:
   The factory is called with each stable file's `Path` and must return a
   `Product` containing its product code, timestamp, path, and optional version.
   A file is registered after its size and modification time remain unchanged
-  across consecutive polls. The optional `product` selects which registered
+  across consecutive polls. Registered file paths are remembered in the
+  pipeline database, so restarting the worker does not register the same file
+  again. The optional `product` selects which registered
   input code triggers candidates; it must be listed in the function's rule
   inputs and defaults to the first input code. For example:
 
