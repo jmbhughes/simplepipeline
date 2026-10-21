@@ -181,6 +181,13 @@ class ConfigWorker:
         self.claim_timeout = timedelta(
             seconds=float(worker_settings.get("claim_timeout_seconds", 86400))
         )
+        self.max_attempts = worker_settings.get("max_attempts", 3)
+        if (
+            isinstance(self.max_attempts, bool)
+            or not isinstance(self.max_attempts, int)
+            or self.max_attempts <= 0
+        ):
+            raise ValueError("worker.max_attempts must be a positive integer")
         if self.poll_interval <= 0:
             raise ValueError("worker.poll_interval_seconds must be positive")
         if self.claim_timeout <= timedelta(0):
@@ -301,7 +308,11 @@ class ConfigWorker:
         results: dict[tuple[str, datetime], str] = {}
         for function in self.functions:
             rule = function.rule
-            candidate_times = set(self.pipeline.incomplete_candidates(rule.name))
+            candidate_times = set(
+                self.pipeline.incomplete_candidates(
+                    rule.name, max_attempts=self.max_attempts
+                )
+            )
             if function.cadence_type == "sensor":
                 assert function.sensor_directory is not None
                 assert function.product_factory is not None
@@ -338,7 +349,9 @@ class ConfigWorker:
                 assert function.trigger_product is not None
                 candidate_times.update(
                     self.pipeline.product_timestamps(
-                        function.trigger_product, excluding_rule=rule.name
+                        function.trigger_product,
+                        excluding_rule=rule.name,
+                        max_attempts=self.max_attempts,
                     )
                 )
             else:
@@ -365,12 +378,24 @@ class ConfigWorker:
                         function.processor,
                         output_version=function.output_version,
                         claim_timeout=self.claim_timeout,
+                        max_attempts=self.max_attempts,
                     )
                 except Exception:
+                    attempts = self.pipeline.candidate_attempts(
+                        rule.name, candidate_time
+                    )
+                    retry_message = (
+                        "maximum attempts reached"
+                        if attempts >= self.max_attempts
+                        else "it will be retried"
+                    )
                     LOGGER.exception(
-                        "Candidate %s at %s failed; it will be retried",
+                        "Candidate %s at %s failed on attempt %s/%s; %s",
                         rule.name,
                         candidate_time.isoformat(),
+                        attempts,
+                        self.max_attempts,
+                        retry_message,
                     )
                     status = "failed"
                 if status == "complete":

@@ -27,6 +27,21 @@ sensor directory. The sensor's `product_factory` maps each detected path to a
 python -m simplepipeline pipeline.toml
 ```
 
+Configure the retry limit in the TOML `[worker]` table:
+
+```toml
+[worker]
+max_attempts = 3
+```
+
+`max_attempts` is the maximum total number of processing attempts for a
+candidate, including its first run. It must be a positive integer and defaults
+to `3`. Attempts are stored in SQLite and survive worker restarts. A candidate
+that reaches the limit remains marked `failed` with its latest error, and is no
+longer retried. Candidates waiting for required inputs do not consume attempts.
+An expired processing claim does consume an attempt; if the limit has already
+been reached, the candidate is marked failed once the claim expires.
+
 The worker logs startup, sensor-file registration, completed candidates, and
 failures to the terminal. Add `--verbose` to include debug messages such as
 polling candidates that are still waiting for inputs:

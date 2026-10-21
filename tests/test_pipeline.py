@@ -120,6 +120,34 @@ def test_week_window_is_start_inclusive_end_exclusive(tmp_path):
     assert pipeline.run_candidate(rule, END, lambda inputs, _: "/output") == "pending"
 
 
+def test_pipeline_stops_retrying_after_max_attempts(tmp_path):
+    pipeline = Pipeline(tmp_path / "pipeline.sqlite3")
+    rule = SameTimestampRule("retry-limit", "L1", "L2")
+    pipeline.add_product(Product("L1", END, "/inputs/one"))
+    calls = []
+
+    def failing_processor(inputs, output_time):
+        calls.append(output_time)
+        raise RuntimeError("processing failed")
+
+    for attempt in range(3):
+        with pytest.raises(RuntimeError, match="processing failed"):
+            pipeline.run_candidate(rule, END, failing_processor, max_attempts=3)
+        assert pipeline.candidate_attempts("retry-limit", END) == attempt + 1
+
+    assert pipeline.run_candidate(rule, END, failing_processor, max_attempts=3) == "failed"
+    assert len(calls) == 3
+    assert pipeline.incomplete_candidates("retry-limit", max_attempts=3) == []
+    assert pipeline.candidate_status("retry-limit", END) == "failed"
+    with sqlite3.connect(pipeline.database) as connection:
+        attempts, error = connection.execute(
+            "SELECT attempts, error FROM candidates WHERE rule_name = ?",
+            ("retry-limit",),
+        ).fetchone()
+    assert attempts == 3
+    assert error == "processing failed"
+
+
 def test_candidate_selection_uses_only_most_recent_input_version(tmp_path):
     pipeline = Pipeline(tmp_path / "pipeline.sqlite3")
     rule = EvenlyDistributedWindowRule(
@@ -374,6 +402,42 @@ def test_config_worker_runs_and_persists_fixed_interval_schedule(tmp_path, monke
     assert ConfigWorker(config_path).run_once(END) == {}
 
 
+def test_config_worker_reads_max_attempts_from_toml(tmp_path, monkeypatch):
+    calls = []
+    processor_module = types.ModuleType("retry_processors")
+
+    def process(inputs, output_time):
+        calls.append(output_time)
+        raise RuntimeError("temporary processor failure")
+
+    processor_module.process = process
+    monkeypatch.setitem(sys.modules, "retry_processors", processor_module)
+    config_path = tmp_path / "pipeline.toml"
+    _write_config(
+        config_path,
+        cadence='type = "on_input"\nproduct = "L1"',
+        processor="retry_processors:process",
+    )
+    config_path.write_text(
+        config_path.read_text().replace(
+            'poll_interval_seconds = 1',
+            'poll_interval_seconds = 1\nmax_attempts = 2',
+        )
+    )
+    worker = ConfigWorker(config_path)
+    pipeline = Pipeline(tmp_path / "worker.sqlite3")
+    pipeline.add_product(Product("L1", END, "/inputs/one"))
+    pipeline.add_product(Product("L1B", END, "/inputs/two"))
+
+    for _ in range(2):
+        assert worker.run_once(END) == {("combine", END): "failed"}
+    assert worker.run_once(END) == {}
+    assert len(calls) == 2
+    assert pipeline.candidate_attempts("combine", END) == 2
+    assert ConfigWorker(config_path).run_once(END) == {}
+    assert len(calls) == 2
+
+
 def test_config_worker_combines_multiple_rules(tmp_path, monkeypatch):
     calls = []
     processor_module = types.ModuleType("test_processors")
@@ -538,5 +602,6 @@ def test_dashboard_serves_recent_pipeline_status(tmp_path):
         "complete",
         "pending",
     ]
+    assert [item["attempts"] for item in status["candidates"]] == [1, 0]
     assert status["products"][0]["product_code"] == "L2"
     assert "<title>simplepipeline dashboard</title>" in page

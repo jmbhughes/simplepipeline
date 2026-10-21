@@ -41,7 +41,7 @@ _DASHBOARD_HTML = """<!doctype html>
   <section>
     <h2>Recent candidates</h2>
     <div class="table-wrap"><table>
-      <thead><tr><th>Function</th><th>Output</th><th>Timestamp</th><th>Status</th><th>Error</th></tr></thead>
+      <thead><tr><th>Function</th><th>Output</th><th>Timestamp</th><th>Status</th><th>Attempts</th><th>Error</th></tr></thead>
       <tbody id="candidates"></tbody>
     </table></div>
   </section>
@@ -81,6 +81,7 @@ _DASHBOARD_HTML = """<!doctype html>
           const row = document.createElement("tr");
           for (const value of [item.function, item.output, item.timestamp]) row.append(el("td", value));
           row.append(el("td", item.status, item.status));
+          row.append(el("td", String(item.attempts)));
           row.append(el("td", item.error, "error"));
           candidates.append(row);
         }
@@ -113,7 +114,8 @@ def read_dashboard_status(database: str) -> dict[str, Any]:
             "FROM candidates GROUP BY status, claim_token"
         ).fetchall()
         candidates = connection.execute(
-            "SELECT rule_name, output_product_code, timestamp, status, error, claim_token "
+            "SELECT rule_name, output_product_code, timestamp, status, error, "
+            "claim_token, attempts "
             "FROM candidates ORDER BY timestamp DESC, id DESC LIMIT 100"
         ).fetchall()
         products = connection.execute(
@@ -136,6 +138,7 @@ def read_dashboard_status(database: str) -> dict[str, Any]:
                 "output": row["output_product_code"],
                 "timestamp": row["timestamp"],
                 "status": "processing" if row["claim_token"] else row["status"],
+                "attempts": row["attempts"],
                 "error": row["error"] or "",
             }
             for row in candidates

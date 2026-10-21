@@ -62,6 +62,7 @@ class Pipeline:
                     error TEXT,
                     claim_token TEXT,
                     claimed_at TEXT,
+                    attempts INTEGER NOT NULL DEFAULT 0,
                     UNIQUE(rule_name, timestamp)
                 );
                 CREATE TABLE IF NOT EXISTS candidate_inputs (
@@ -105,6 +106,10 @@ class Pipeline:
                 db.execute("ALTER TABLE candidates ADD COLUMN claim_token TEXT")
             if "claimed_at" not in candidate_columns:
                 db.execute("ALTER TABLE candidates ADD COLUMN claimed_at TEXT")
+            if "attempts" not in candidate_columns:
+                db.execute(
+                    "ALTER TABLE candidates ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0"
+                )
 
     def add_product(self, product: Product) -> Product:
         created_at = timestamp_text(datetime.now(timezone.utc))
@@ -180,6 +185,7 @@ class Pipeline:
         *,
         output_version: str = "0.0.0",
         claim_timeout: timedelta = timedelta(days=1),
+        max_attempts: int = 3,
     ) -> str:
         """Attempt a scheduled output once; pending candidates may be retried.
 
@@ -190,6 +196,12 @@ class Pipeline:
         """
         if claim_timeout <= timedelta(0):
             raise ValueError("claim_timeout must be positive")
+        if (
+            not isinstance(max_attempts, int)
+            or isinstance(max_attempts, bool)
+            or max_attempts <= 0
+        ):
+            raise ValueError("max_attempts must be a positive integer")
         semantic_version_key(output_version)
         output_timestamp = normalize_timestamp(output_timestamp)
         timestamp = timestamp_text(output_timestamp)
@@ -207,6 +219,18 @@ class Pipeline:
                 claim_age = claim_time - parse_timestamp(row["claimed_at"])
                 if claim_age < claim_timeout:
                     return "processing"
+                if row["attempts"] >= max_attempts:
+                    db.execute(
+                        "UPDATE candidates SET status = 'failed', "
+                        "error = ?, claim_token = NULL, claimed_at = NULL WHERE id = ?",
+                        (
+                            f"maximum attempts ({max_attempts}) reached after claim expired",
+                            row["id"],
+                        ),
+                    )
+                    return "failed"
+            if row and row["attempts"] >= max_attempts:
+                return "failed"
 
             if row is None:
                 cursor = db.execute(
@@ -245,7 +269,8 @@ class Pipeline:
                 return "pending"
 
             db.execute(
-                "UPDATE candidates SET status = 'pending', error = NULL, claim_token = ?, claimed_at = ? WHERE id = ?",
+                "UPDATE candidates SET status = 'pending', error = NULL, "
+                "claim_token = ?, claimed_at = ?, attempts = attempts + 1 WHERE id = ?",
                 (claim_token, timestamp_text(claim_time), candidate_id),
             )
 
@@ -339,17 +364,32 @@ class Pipeline:
             return None
         return "processing" if row["claim_token"] else row["status"]
 
-    def incomplete_candidates(self, rule_name: str) -> list[datetime]:
+    def incomplete_candidates(
+        self, rule_name: str, *, max_attempts: int = 3
+    ) -> list[datetime]:
         with self._connect() as db:
             rows = db.execute(
                 "SELECT timestamp FROM candidates "
-                "WHERE rule_name = ? AND status != 'complete' ORDER BY timestamp",
-                (rule_name,),
+                "WHERE rule_name = ? AND status != 'complete' "
+                "AND (attempts < ? OR claim_token IS NOT NULL) ORDER BY timestamp",
+                (rule_name, max_attempts),
             ).fetchall()
         return [parse_timestamp(row["timestamp"]) for row in rows]
 
+    def candidate_attempts(self, rule_name: str, output_timestamp: datetime) -> int:
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT attempts FROM candidates WHERE rule_name = ? AND timestamp = ?",
+                (rule_name, timestamp_text(output_timestamp)),
+            ).fetchone()
+        return int(row["attempts"]) if row is not None else 0
+
     def product_timestamps(
-        self, product_code: str, *, excluding_rule: str | None = None
+        self,
+        product_code: str,
+        *,
+        excluding_rule: str | None = None,
+        max_attempts: int = 3,
     ) -> list[datetime]:
         validate_product_code(product_code)
         with self._connect() as db:
@@ -363,8 +403,9 @@ class Pipeline:
                     row["timestamp"]
                     for row in db.execute(
                         "SELECT timestamp FROM candidates "
-                        "WHERE rule_name = ? AND status = 'complete'",
-                        (excluding_rule,),
+                        "WHERE rule_name = ? AND (status = 'complete' "
+                        "OR (attempts >= ? AND claim_token IS NULL))",
+                        (excluding_rule, max_attempts),
                     )
                 }
         products = latest_version_products(
@@ -423,6 +464,7 @@ class DailyWorker:
         poll_interval: float = 60,
         claim_timeout: timedelta = timedelta(days=1),
         output_version: str = "0.0.0",
+        max_attempts: int = 3,
     ) -> None:
         if not rules:
             raise ValueError("at least one rule is required")
@@ -430,6 +472,12 @@ class DailyWorker:
             raise ValueError("poll_interval must be positive")
         if claim_timeout <= timedelta(0):
             raise ValueError("claim_timeout must be positive")
+        if (
+            not isinstance(max_attempts, int)
+            or isinstance(max_attempts, bool)
+            or max_attempts <= 0
+        ):
+            raise ValueError("max_attempts must be a positive integer")
         semantic_version_key(output_version)
         names = [rule.name for rule in rules]
         if len(set(names)) != len(names):
@@ -441,6 +489,7 @@ class DailyWorker:
         self.poll_interval = poll_interval
         self.claim_timeout = claim_timeout
         self.output_version = output_version
+        self.max_attempts = max_attempts
         self.pipeline = Pipeline(self.database)
         self._next_date = start_date
         self._scheduled: set[tuple[int, date]] = set()
@@ -469,16 +518,28 @@ class DailyWorker:
                     self.processor,
                     output_version=self.output_version,
                     claim_timeout=self.claim_timeout,
+                    max_attempts=self.max_attempts,
                 )
             except Exception:
+                attempts = self.pipeline.candidate_attempts(rule.name, candidate_time)
+                retry_message = (
+                    "maximum attempts reached"
+                    if attempts >= self.max_attempts
+                    else "it will be retried"
+                )
                 LOGGER.exception(
-                    "Candidate %s at %s failed; it will be retried",
+                    "Candidate %s at %s failed on attempt %s/%s; %s",
                     rule.name,
                     candidate_time.isoformat(),
+                    attempts,
+                    self.max_attempts,
+                    retry_message,
                 )
                 status = "failed"
             results[key] = status
-            if status == "complete":
+            if status == "complete" or self.pipeline.candidate_attempts(
+                rule.name, candidate_time
+            ) >= self.max_attempts:
                 self._scheduled.discard((rule_index, candidate_date))
         return results
 

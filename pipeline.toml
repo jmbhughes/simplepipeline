@@ -2,6 +2,7 @@
 database = "pipeline.sqlite3"
 poll_interval_seconds = 30
 claim_timeout_seconds = 86400
+max_attempts = 3
 
 [functions.l2]
 output = "L2"
