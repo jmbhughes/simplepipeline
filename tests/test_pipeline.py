@@ -1,5 +1,6 @@
 from datetime import datetime, timedelta, timezone
 import json
+import runpy
 import sqlite3
 import sys
 from threading import Event, Thread
@@ -11,6 +12,9 @@ from urllib.request import urlopen
 
 import pytest
 
+import simplepipeline.cli as cli_module
+import simplepipeline.config as config_module
+import simplepipeline.rules as rules_module
 from simplepipeline import (
     ConfigWorker,
     DailyWorker,
@@ -20,11 +24,18 @@ from simplepipeline import (
     RandomDistributedWindowRule,
 )
 from simplepipeline.config import _run_config_process
-from simplepipeline.dashboard import DashboardServer
+from simplepipeline.dashboard import DashboardServer, read_dashboard_status
 from simplepipeline.engine import daily_utc_candidates
-from simplepipeline.models import semantic_version_key
+from simplepipeline.models import (
+    Rule,
+    latest_version_products,
+    normalize_timestamp,
+    parse_timestamp,
+    semantic_version_key,
+    timestamp_text,
+    validate_product_code,
+)
 from simplepipeline.rules import SameTimestampRule
-import simplepipeline.rules as rules_module
 
 
 UTC = timezone.utc
@@ -304,6 +315,30 @@ def test_daily_worker_retries_pending_candidates_until_inputs_are_available(tmp_
     assert worker.run_once(END) == {("daily", END): "complete"}
     assert worker.run_once(END) == {}
     assert pipeline.candidate_status("daily", END) == "complete"
+
+
+def test_daily_worker_validates_options_and_unique_rule_names(tmp_path):
+    rule = SameTimestampRule("one", "L1", "L2")
+    for kwargs, message in [
+        ({"rules": []}, "at least one rule"),
+        ({"poll_interval": 0}, "poll_interval"),
+        ({"claim_timeout": timedelta(0)}, "claim_timeout"),
+        ({"max_attempts": 0}, "max_attempts"),
+        ({"output_version": "bad"}, "semantic version"),
+        (
+            {"rules": [rule, SameTimestampRule("one", "L1B", "L2")]},
+            "unique",
+        ),
+    ]:
+        rules = kwargs.pop("rules", [rule])
+        with pytest.raises(ValueError, match=message):
+            DailyWorker(
+                tmp_path / "invalid.sqlite3",
+                rules,
+                _worker_processor,
+                start_date=END.date(),
+                **kwargs,
+            )
 
 
 def test_processing_claim_does_not_block_ingestion_or_duplicate_work(tmp_path):
@@ -664,6 +699,74 @@ def test_config_worker_process_handles_keyboard_interrupt(monkeypatch):
     _run_config_process("unused.toml", None)
 
 
+def test_config_worker_process_runs_to_completion(monkeypatch):
+    calls = []
+
+    def run_forever(self, stop_event):
+        calls.append(stop_event)
+
+    monkeypatch.setattr(ConfigWorker, "__init__", lambda self, config_path: None)
+    monkeypatch.setattr(ConfigWorker, "run_forever", run_forever)
+    event = object()
+    _run_config_process("unused.toml", event)
+    assert calls == [event]
+
+
+def test_config_worker_run_forever_exits_when_stop_event_is_set(tmp_path, monkeypatch):
+    processor_module = types.ModuleType("test_processors")
+    processor_module.process = _worker_processor
+    monkeypatch.setitem(sys.modules, "test_processors", processor_module)
+    config_path = tmp_path / "pipeline.toml"
+    _write_config(config_path, cadence='type = "on_input"\nproduct = "L1"')
+    worker = ConfigWorker(config_path)
+    calls = []
+
+    class StopAfterFirstWait:
+        def __init__(self):
+            self.wait_count = 0
+
+        def is_set(self):
+            return False
+
+        def wait(self, timeout):
+            calls.append(timeout)
+            self.wait_count += 1
+            return self.wait_count == 1
+
+    monkeypatch.setattr(worker, "run_once", lambda: calls.append("poll"))
+    worker.run_forever(StopAfterFirstWait())
+    assert calls == ["poll", worker.poll_interval]
+
+
+def test_sensor_cadence_reports_missing_directory(tmp_path, monkeypatch):
+    processor_module = types.ModuleType("sensor_processors")
+    processor_module.process = _worker_processor
+    processor_module.product_from_path = lambda path: Product("L1", END, str(path))
+    monkeypatch.setitem(sys.modules, "sensor_processors", processor_module)
+    missing = tmp_path / "not-created"
+    config_path = tmp_path / "pipeline.toml"
+    config_path.write_text(
+        f'''[worker]
+database = "worker.sqlite3"
+
+[functions.sensor_l2]
+output = "L2"
+processor = "sensor_processors:process"
+
+[[functions.sensor_l2.rules]]
+type = "same_timestamp"
+inputs = ["L1"]
+
+[functions.sensor_l2.cadence]
+type = "sensor"
+directory = "{missing}"
+product_factory = "sensor_processors:product_from_path"
+'''
+    )
+    with pytest.raises(NotADirectoryError, match="sensor directory"):
+        ConfigWorker(config_path).run_once(END)
+
+
 def test_dashboard_serves_recent_pipeline_status(tmp_path, caplog):
     caplog.set_level("DEBUG", logger="simplepipeline.dashboard")
     pipeline = Pipeline(tmp_path / "pipeline.sqlite3")
@@ -722,3 +825,585 @@ def test_dashboard_serves_recent_pipeline_status(tmp_path, caplog):
         "L2",
     }
     assert '"GET ' not in caplog.text
+
+
+def test_dashboard_rejects_reversed_time_window_and_handles_missing_database(tmp_path):
+    pipeline = Pipeline(tmp_path / "pipeline.sqlite3")
+    with pytest.raises(ValueError, match="start must not be later"):
+        read_dashboard_status(
+            pipeline.database,
+            start=END.isoformat(),
+            end=(END - timedelta(days=1)).isoformat(),
+        )
+    one_sided = read_dashboard_status(
+        pipeline.database, start=END.isoformat()
+    )
+    assert one_sided["candidates"] == []
+    assert one_sided["products"] == []
+
+    dashboard = DashboardServer(str(tmp_path / "missing.sqlite3"), port=0)
+    dashboard.start()
+    try:
+        host, port = dashboard.address
+        with pytest.raises(HTTPError) as missing_route:
+            urlopen(f"http://{host}:{port}/missing")
+        assert missing_route.value.code == 404
+        with pytest.raises(HTTPError) as database_error:
+            urlopen(f"http://{host}:{port}/api/status")
+        assert database_error.value.code == 500
+    finally:
+        dashboard.close()
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"claim_timeout": timedelta(0)}, "claim_timeout"),
+        ({"max_attempts": 0}, "max_attempts"),
+        ({"max_attempts": True}, "max_attempts"),
+        ({"output_version": "invalid"}, "semantic version"),
+    ],
+)
+def test_run_candidate_rejects_invalid_options(tmp_path, kwargs, message):
+    pipeline = Pipeline(tmp_path / "pipeline.sqlite3")
+    rule = SameTimestampRule("validate", "L1", "L2")
+    with pytest.raises(ValueError, match=message):
+        pipeline.run_candidate(rule, END, _worker_processor, **kwargs)
+
+
+def test_add_product_is_idempotent_and_rejects_conflicting_path(tmp_path):
+    pipeline = Pipeline(tmp_path / "pipeline.sqlite3")
+    product = Product("L1", END, "/inputs/one")
+    first = pipeline.add_product(product)
+    duplicate = pipeline.add_product(product)
+    assert duplicate.product_id == first.product_id
+    with pytest.raises(ValueError, match="already exists"):
+        pipeline.add_product(Product("L1", END, "/inputs/different"))
+
+
+def test_candidate_without_inputs_and_expired_claim_at_limit(tmp_path):
+    pipeline = Pipeline(tmp_path / "pipeline.sqlite3")
+    rule = SameTimestampRule("expired", "L1", "L2")
+    assert pipeline.candidate_inputs("missing", END) == []
+    assert pipeline.run_candidate(rule, END, _worker_processor, max_attempts=1) == "pending"
+    pipeline.add_product(Product("L1", END, "/inputs/one"))
+    assert pipeline.run_candidate(rule, END, _worker_processor, max_attempts=1) == "complete"
+
+    timestamp = timestamp_text(END + timedelta(seconds=1))
+    with sqlite3.connect(pipeline.database) as db:
+        db.execute(
+            "INSERT INTO candidates(rule_name, output_product_code, timestamp, status, "
+            "claim_token, claimed_at, attempts) VALUES (?, ?, ?, 'pending', ?, ?, ?)",
+            (
+                rule.name,
+                "L2",
+                timestamp,
+                "expired-token",
+                "2020-01-01T00:00:00.000000Z",
+                1,
+            ),
+        )
+    assert pipeline.run_candidate(
+        rule,
+        END + timedelta(seconds=1),
+        _worker_processor,
+        claim_timeout=timedelta(seconds=1),
+        max_attempts=1,
+    ) == "failed"
+    assert pipeline.candidate_status(rule.name, END + timedelta(seconds=1)) == "failed"
+
+
+def test_candidate_processor_empty_path_records_failure(tmp_path):
+    pipeline = Pipeline(tmp_path / "pipeline.sqlite3")
+    rule = SameTimestampRule("empty-output", "L1", "L2")
+    pipeline.add_product(Product("L1", END, "/inputs/one"))
+    with pytest.raises(ValueError, match="non-empty output path"):
+        pipeline.run_candidate(rule, END, lambda inputs, timestamp: "")
+    assert pipeline.candidate_status("empty-output", END) == "failed"
+
+
+def test_candidate_reuses_existing_output_product(tmp_path):
+    pipeline = Pipeline(tmp_path / "pipeline.sqlite3")
+    rule = SameTimestampRule("existing-output", "L1", "L2")
+    pipeline.add_product(Product("L1", END, "/inputs/one"))
+    output = pipeline.add_product(Product("L2", END, "/outputs/existing"))
+    assert pipeline.run_candidate(
+        rule, END, lambda inputs, timestamp: "/outputs/not-used"
+    ) == "complete"
+    assert pipeline.products("L2") == [output]
+    assert pipeline.candidate_inputs("existing-output", END)[0].product_code == "L1"
+
+
+def test_product_timestamps_excludes_completed_and_exhausted_candidates(tmp_path):
+    pipeline = Pipeline(tmp_path / "pipeline.sqlite3")
+    rule = SameTimestampRule("dedupe", "L1", "L2")
+    for timestamp in (END, END + timedelta(seconds=1)):
+        pipeline.add_product(Product("L1", timestamp, f"/inputs/{timestamp.second}"))
+    assert pipeline.run_candidate(rule, END, _worker_processor) == "complete"
+    with pytest.raises(RuntimeError):
+        pipeline.run_candidate(
+            rule,
+            END + timedelta(seconds=1),
+            lambda inputs, timestamp: (_ for _ in ()).throw(RuntimeError("failed")),
+            max_attempts=1,
+        )
+    assert pipeline.product_timestamps(
+        "L1", excluding_rule="dedupe", max_attempts=1
+    ) == []
+    assert pipeline.product_timestamps("L1", excluding_rule=None) == [
+        END,
+        END + timedelta(seconds=1),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("2026-10-16T00:00:00Z", END),
+        ("2026-10-16T02:00:00+02:00", END),
+    ],
+)
+def test_timestamp_helpers_normalize_to_utc(value, expected):
+    assert normalize_timestamp(datetime.fromisoformat(value.replace("Z", "+00:00"))) == expected
+    assert parse_timestamp(value) == expected
+    assert timestamp_text(expected) == "2026-10-16T00:00:00.000000Z"
+
+
+@pytest.mark.parametrize(
+    ("code", "message"),
+    [
+        ("", "non-empty"),
+        ("A" * 17, "at most 16"),
+        (" L1", "whitespace"),
+        ("L1 ", "whitespace"),
+    ],
+)
+def test_product_code_validation_errors(code, message):
+    with pytest.raises(ValueError, match=message):
+        validate_product_code(code)
+
+
+def test_product_and_rule_validation_errors():
+    with pytest.raises(ValueError, match="path"):
+        Product("L1", END, "")
+    with pytest.raises(ValueError, match="rule name"):
+        Rule("", "L1", "L2")
+    with pytest.raises(ValueError, match="at least one"):
+        SameTimestampRule("empty", [], "L2")
+    with pytest.raises(ValueError, match="unique"):
+        SameTimestampRule("duplicate", ["L1", "L1"], "L2")
+
+
+def test_semantic_version_rejects_invalid_values_and_breaks_build_ties():
+    for version in ("1.0", "01.0.0", "1.0.0-01", 1):
+        with pytest.raises(ValueError):
+            semantic_version_key(version)
+    assert semantic_version_key("1.0.0+build.2") > semantic_version_key(
+        "1.0.0+build.1"
+    )
+    with pytest.raises(ValueError, match="timezone-aware"):
+        normalize_timestamp(datetime(2026, 10, 16))
+
+
+def test_latest_version_products_keeps_each_code_latest_version():
+    products = [
+        Product("L1", END, "/old", version="1.0.0"),
+        Product("L1", END + timedelta(days=1), "/new", version="2.0.0"),
+        Product("L2", END, "/other"),
+    ]
+    assert [product.path for product in latest_version_products(products)] == [
+        "/new",
+        "/other",
+    ]
+    with pytest.raises(NotImplementedError):
+        Rule("base", "L1", "L2").select_inputs([], END)
+
+
+def test_window_rule_validation_and_exact_count_edges():
+    with pytest.raises(ValueError, match="window must be positive"):
+        EvenlyDistributedWindowRule(
+            "bad", "L1", "L2", window=timedelta(0), count=1
+        )
+    with pytest.raises(ValueError, match="count must be positive"):
+        EvenlyDistributedWindowRule(
+            "bad", "L1", "L2", window=timedelta(days=1), count=0
+        )
+    rule = EvenlyDistributedWindowRule(
+        "weekly", "L1", "L2", window=timedelta(days=1), count=2
+    )
+    products = [
+        Product("L1", END - timedelta(hours=12), "/a"),
+        Product("L1", END - timedelta(hours=12), "/b"),
+    ]
+    assert [p.path for p in rule.select_inputs(products, END)] == ["/a", "/b"]
+    with pytest.raises(ValueError, match="timezone-aware"):
+        rule.select_inputs(products, END.replace(tzinfo=None))
+
+
+def test_random_window_validation_and_nonmatching_inputs():
+    with pytest.raises(ValueError, match="window must be positive"):
+        RandomDistributedWindowRule(
+            "bad", "L1", "L2", window=timedelta(0), count=1
+        )
+    with pytest.raises(ValueError, match="count must be positive"):
+        RandomDistributedWindowRule(
+            "bad", "L1", "L2", window=timedelta(days=1), count=0
+        )
+    rule = RandomDistributedWindowRule(
+        "random", "L1", "L2", window=timedelta(days=1), count=1
+    )
+    assert rule.select_inputs(
+        [Product("L2", END - timedelta(hours=1), "/wrong")], END
+    ) == []
+
+
+def test_composite_rule_validates_and_deduplicates_inputs():
+    one = SameTimestampRule("one", "L1", "L2")
+    same_product = SameTimestampRule("two", "L1", "L2")
+    composite = rules_module.CompositeRule("combined", [one, same_product])
+    selected = composite.select_inputs(
+        [Product("L1", END, "/input")], END
+    )
+    assert [product.path for product in selected] == ["/input"]
+    with pytest.raises(ValueError, match="rule name"):
+        rules_module.CompositeRule("", [one])
+    with pytest.raises(ValueError, match="at least one"):
+        rules_module.CompositeRule("empty", [])
+    with pytest.raises(ValueError, match="same output"):
+        rules_module.CompositeRule(
+            "mixed", [one, SameTimestampRule("other", "L1", "L3")]
+        )
+
+
+def test_cli_main_without_dashboard(monkeypatch):
+    calls = []
+
+    class FakeWorker:
+        database = "pipeline.sqlite3"
+        joins = 0
+
+        def __init__(self, config):
+            calls.append(("init", config))
+
+        def start(self):
+            calls.append(("start",))
+
+        def join(self):
+            return 0
+
+    monkeypatch.setattr(cli_module, "ConfigWorker", FakeWorker)
+    monkeypatch.setattr(sys, "argv", ["simplepipeline", "pipeline.toml"])
+    assert cli_module.main() == 0
+    assert calls == [("init", "pipeline.toml"), ("start",)]
+
+
+def test_cli_main_dashboard_verbose_and_keyboard_interrupt(monkeypatch):
+    calls = []
+
+    class FakeWorker:
+        database = "pipeline.sqlite3"
+        joins = 0
+
+        def __init__(self, config):
+            pass
+
+        def start(self):
+            calls.append("worker-start")
+
+        def join(self):
+            self.joins += 1
+            if self.joins == 1:
+                raise KeyboardInterrupt
+            return 0
+
+        def stop(self):
+            calls.append("worker-stop")
+
+    class FakeDashboard:
+        def __init__(self, database, host, port):
+            calls.append((database, host, port))
+
+        def start(self):
+            calls.append("dashboard-start")
+
+        def close(self):
+            calls.append("dashboard-close")
+
+    monkeypatch.setattr(cli_module, "ConfigWorker", FakeWorker)
+    monkeypatch.setattr(cli_module, "DashboardServer", FakeDashboard)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "simplepipeline",
+            "pipeline.toml",
+            "--dashboard",
+            "--dashboard-host",
+            "localhost",
+            "--dashboard-port",
+            "9000",
+            "--verbose",
+        ],
+    )
+    assert cli_module.main() == 0
+    assert calls == [
+        ("pipeline.sqlite3", "localhost", 9000),
+        "worker-start",
+        "dashboard-start",
+        "worker-stop",
+        "dashboard-close",
+    ]
+
+
+def test_cli_dashboard_start_failure_stops_worker(monkeypatch):
+    calls = []
+
+    class FakeWorker:
+        database = "pipeline.sqlite3"
+
+        def __init__(self, config):
+            pass
+
+        def start(self):
+            calls.append("start")
+
+        def stop(self):
+            calls.append("stop")
+
+        def join(self):
+            calls.append("join")
+
+    class BrokenDashboard:
+        def __init__(self, database, host, port):
+            pass
+
+        def start(self):
+            raise OSError("port busy")
+
+    monkeypatch.setattr(cli_module, "ConfigWorker", FakeWorker)
+    monkeypatch.setattr(cli_module, "DashboardServer", BrokenDashboard)
+    monkeypatch.setattr(
+        sys, "argv", ["simplepipeline", "pipeline.toml", "--dashboard"]
+    )
+    with pytest.raises(OSError, match="port busy"):
+        cli_module.main()
+    assert calls == ["start", "stop", "join"]
+
+
+def test_cli_returns_nonzero_for_worker_failure(monkeypatch):
+    class FailedWorker:
+        database = "pipeline.sqlite3"
+
+        def __init__(self, config):
+            pass
+
+        def start(self):
+            pass
+
+        def join(self):
+            return 2
+
+    monkeypatch.setattr(cli_module, "ConfigWorker", FailedWorker)
+    monkeypatch.setattr(sys, "argv", ["simplepipeline", "pipeline.toml"])
+    assert cli_module.main() == 1
+
+
+def test_module_entrypoint_exits_with_cli_status(monkeypatch):
+    monkeypatch.setattr(cli_module, "main", lambda: 7)
+    with pytest.raises(SystemExit) as error:
+        runpy.run_module("simplepipeline.__main__", run_name="__main__")
+    assert error.value.code == 7
+
+
+def _base_config_text():
+    return (
+        '[functions.f]\noutput = "L2"\ninputs = ["L1"]\n'
+        'rule = "same_timestamp"\nprocessor = "test_processors:process"\n'
+        '[functions.f.cadence]\ntype = "on_input"\n'
+    )
+
+
+@pytest.mark.parametrize(
+    ("settings", "message"),
+    [
+        ({}, "output product code"),
+        ({"output": "L2"}, "non-empty inputs"),
+        ({"output": "L2", "inputs": ["L1"], "rule": "unknown"}, "unsupported rule"),
+        (
+            {
+                "output": "L2",
+                "inputs": ["L1", "L1B"],
+                "rule": "evenly_distributed_window",
+            },
+            "exactly one input",
+        ),
+        (
+            {
+                "output": "L2",
+                "inputs": ["L1"],
+                "rule": "random_distributed_window",
+                "window_seconds": "bad",
+                "count": 1,
+            },
+            "window_seconds and count",
+        ),
+        (
+            {
+                "output": "L2",
+                "rules": [],
+            },
+            "non-empty rules",
+        ),
+        (
+            {
+                "output": "L2",
+                "rules": ["bad"],
+            },
+            "must be a table",
+        ),
+    ],
+)
+def test_rule_configuration_validation(settings, message):
+    with pytest.raises(ValueError, match=message):
+        config_module._make_rule("configured", settings)
+
+
+@pytest.mark.parametrize(
+    ("config_text", "message"),
+    [
+        ('worker = "bad"\n' + _base_config_text(), "\\[worker\\]"),
+        (
+            '[worker]\ndatabase = 1\n' + _base_config_text(),
+            "database",
+        ),
+        ('[worker]\nmax_attempts = 0\n' + _base_config_text(), "max_attempts"),
+        (
+            '[worker]\npoll_interval_seconds = 0\n' + _base_config_text(),
+            "poll_interval_seconds",
+        ),
+        (
+            '[worker]\nclaim_timeout_seconds = 0\n' + _base_config_text(),
+            "claim_timeout_seconds",
+        ),
+        ("functions = []\n", "at least one"),
+        ("[functions]\nf = 1\n", "must be a TOML table"),
+        ('[functions.f]\noutput = 7\n', "output product code"),
+        (
+            '[functions.f]\noutput = "L2"\ninputs = ["L1"]\nrule = "same_timestamp"\n',
+            "processor",
+        ),
+    ],
+)
+def test_config_worker_rejects_invalid_top_level_settings(
+    tmp_path, monkeypatch, config_text, message
+):
+    module = types.ModuleType("test_processors")
+    module.process = _worker_processor
+    monkeypatch.setitem(sys.modules, "test_processors", module)
+    path = tmp_path / "invalid.toml"
+    path.write_text(config_text)
+    with pytest.raises(ValueError, match=message):
+        ConfigWorker(path)
+
+
+@pytest.mark.parametrize(
+    ("function_settings", "message"),
+    [
+        (
+            'output = "L2"\ninputs = ["L1"]\nrule = "same_timestamp"\n'
+            'processor = "test_processors:process"\noutput_version = 3\n'
+            '[functions.f.cadence]\ntype = "on_input"\n',
+            "output_version",
+        ),
+        (
+            'output = "L2"\ninputs = ["L1"]\nrule = "same_timestamp"\n'
+            'processor = "test_processors:process"\n',
+            "cadence",
+        ),
+        (
+            'output = "L2"\ninputs = ["L1"]\nrule = "same_timestamp"\n'
+            'processor = "test_processors:process"\n'
+            '[functions.f.cadence]\ntype = "mystery"\n',
+            "cadence.type",
+        ),
+        (
+            'output = "L2"\ninputs = ["L1"]\nrule = "same_timestamp"\n'
+            'processor = "test_processors:process"\n'
+            '[functions.f.cadence]\ntype = "on_input"\nproduct = "L1B"\n',
+            "trigger product",
+        ),
+        (
+            'output = "L2"\ninputs = ["L1"]\nrule = "same_timestamp"\n'
+            'processor = "test_processors:process"\n'
+            '[functions.f.cadence]\ntype = "interval"\nevery_seconds = 0\n'
+            'start_at = "2026-10-16T00:00:00Z"\n',
+            "every_seconds must be positive",
+        ),
+        (
+            'output = "L2"\ninputs = ["L1"]\nrule = "same_timestamp"\n'
+            'processor = "test_processors:process"\n'
+            '[functions.f.cadence]\ntype = "interval"\nevery_seconds = 1\n'
+            'start_at = "not-time"\n',
+            "interval cadence requires",
+        ),
+        (
+            'output = "L2"\ninputs = ["L1"]\nrule = "same_timestamp"\n'
+            'processor = "test_processors:process"\n'
+            '[functions.f.cadence]\ntype = "sensor"\ndirectory = "incoming"\n'
+            'product_factory = "test_processors:product_from_path"\nextension = "fits"\n',
+            "extension",
+        ),
+        (
+            'output = "L2"\ninputs = ["L1"]\nrule = "same_timestamp"\n'
+            'processor = "test_processors:process"\n'
+            '[functions.f.cadence]\ntype = "sensor"\ndirectory = "incoming"\n'
+            'product_factory = "test_processors:product_from_path"\nproduct = "L1B"\n',
+            "trigger product",
+        ),
+    ],
+)
+def test_config_worker_rejects_invalid_function_settings(
+    tmp_path, monkeypatch, function_settings, message
+):
+    module = types.ModuleType("test_processors")
+    module.process = _worker_processor
+    module.product_from_path = lambda path: Product("L1", END, str(path))
+    monkeypatch.setitem(sys.modules, "test_processors", module)
+    path = tmp_path / "invalid.toml"
+    path.write_text(
+        '[worker]\ndatabase = "worker.sqlite3"\n[functions.f]\n'
+        + function_settings
+    )
+    with pytest.raises(ValueError, match=message):
+        ConfigWorker(path)
+
+
+def test_processor_and_factory_references_are_validated(tmp_path, monkeypatch):
+    with pytest.raises(ValueError, match="module:function"):
+        config_module._load_processor("missing-colon", tmp_path)
+    with pytest.raises(ValueError, match="invalid processor"):
+        config_module._load_processor(":function", tmp_path)
+    with pytest.raises(ValueError, match="product_factory"):
+        config_module._load_product_factory("missing-colon", tmp_path)
+
+    module = types.ModuleType("invalid_factory_module")
+    module.factory = lambda path: "not a Product"
+    monkeypatch.setitem(sys.modules, "invalid_factory_module", module)
+    factory = config_module._load_product_factory(
+        "invalid_factory_module:factory", tmp_path
+    )
+    with pytest.raises(TypeError, match="must return a Product"):
+        factory(tmp_path / "input")
+
+
+@pytest.mark.parametrize(
+    ("value", "message"),
+    [
+        (None, "timezone"),
+        ("not-a-date", "timezone"),
+        ("2026-10-16T00:00:00", "timezone"),
+    ],
+)
+def test_config_timestamp_parser_rejects_invalid_values(value, message):
+    with pytest.raises(ValueError, match=message):
+        config_module._parse_timestamp(value, "test timestamp")
