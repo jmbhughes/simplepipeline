@@ -394,4 +394,7 @@ class ConfigWorker:
 
 
 def _run_config_process(config_path: str, stop_event) -> None:
-    ConfigWorker(config_path).run_forever(stop_event)
+    try:
+        ConfigWorker(config_path).run_forever(stop_event)
+    except KeyboardInterrupt:
+        return

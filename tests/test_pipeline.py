@@ -14,6 +14,7 @@ from simplepipeline import (
     Pipeline,
     Product,
 )
+from simplepipeline.config import _run_config_process
 from simplepipeline.engine import daily_utc_candidates
 from simplepipeline.models import semantic_version_key
 from simplepipeline.rules import SameTimestampRule
@@ -491,3 +492,12 @@ def test_config_worker_runs_processor_in_a_separate_process(tmp_path):
     assert pipeline.candidate_status("combine", END) == "complete"
     assert worker.stop(timeout=5)
     assert worker.join(timeout=0) == 0
+
+
+def test_config_worker_process_handles_keyboard_interrupt(monkeypatch):
+    def interrupt(self, stop_event):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(ConfigWorker, "__init__", lambda self, config_path: None)
+    monkeypatch.setattr(ConfigWorker, "run_forever", interrupt)
+    _run_config_process("unused.toml", None)
