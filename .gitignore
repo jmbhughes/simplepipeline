@@ -89,3 +89,4 @@ coverage.xml
 # Operating System Files
 .DS_Store
 Thumbs.db
+pipeline.sqlite3
