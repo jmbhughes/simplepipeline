@@ -27,6 +27,26 @@ sensor directory. The sensor's `product_factory` maps each detected path to a
 python -m simplepipeline pipeline.toml
 ```
 
+The worker logs startup, sensor-file registration, completed candidates, and
+failures to the terminal. Add `--verbose` to include debug messages such as
+polling candidates that are still waiting for inputs:
+
+```sh
+python -m simplepipeline pipeline.toml --verbose
+```
+
+To open a live browser dashboard showing recent candidates and products, start
+the worker with `--dashboard`:
+
+```sh
+python -m simplepipeline pipeline.toml --dashboard
+```
+
+The dashboard refreshes automatically at `http://127.0.0.1:8765`. Choose a
+different port with `--dashboard-port 9000`. It binds to localhost by default;
+to expose it to other machines, pass `--dashboard-host 0.0.0.0` and ensure the
+host firewall and network are appropriately restricted.
+
 The example [`pipeline.toml`](./pipeline.toml) configures an L2 function that
 creates an output at each registered L1 timestamp. Its processor,
 `demo:make_l2`, receives a list of input `Product` records and the candidate

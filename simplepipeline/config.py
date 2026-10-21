@@ -288,6 +288,12 @@ class ConfigWorker:
         self.pipeline = Pipeline(self.database)
         self._process: multiprocessing.Process | None = None
         self._stop_event = None
+        LOGGER.info(
+            "Loaded %d pipeline function(s) from %s using database %s",
+            len(self.functions),
+            self.config_path,
+            self.database,
+        )
 
     def run_once(self, now: datetime | None = None) -> dict[tuple[str, datetime], str]:
         """Run due candidates and retry unfinished candidates."""
@@ -313,10 +319,20 @@ class ConfigWorker:
                     signature = (stat.st_size, stat.st_mtime_ns)
                     if self._sensor_observations.get(key) != signature:
                         self._sensor_observations[key] = signature
+                        LOGGER.debug(
+                            "Sensor observed file; waiting for it to stabilize: %s",
+                            path,
+                        )
                         continue
                     product = function.product_factory(path)
-                    self.pipeline.add_product(product)
+                    registered = self.pipeline.add_product(product)
                     self._sensor_registered_paths.add(key)
+                    LOGGER.info(
+                        "Registered sensor file %s as %s at %s",
+                        path,
+                        registered.product_code,
+                        registered.timestamp.isoformat(),
+                    )
 
             if function.cadence_type in ("on_input", "sensor"):
                 assert function.trigger_product is not None
@@ -338,6 +354,11 @@ class ConfigWorker:
 
             for candidate_time in sorted(candidate_times):
                 try:
+                    LOGGER.debug(
+                        "Processing candidate %s at %s",
+                        rule.name,
+                        candidate_time.isoformat(),
+                    )
                     status = self.pipeline.run_candidate(
                         rule,
                         candidate_time,
@@ -352,11 +373,24 @@ class ConfigWorker:
                         candidate_time.isoformat(),
                     )
                     status = "failed"
+                if status == "complete":
+                    LOGGER.info(
+                        "Completed candidate %s at %s",
+                        rule.name,
+                        candidate_time.isoformat(),
+                    )
+                elif status == "pending":
+                    LOGGER.debug(
+                        "Candidate %s at %s is waiting for inputs",
+                        rule.name,
+                        candidate_time.isoformat(),
+                    )
                 results[(rule.name, candidate_time)] = status
         return results
 
     def run_forever(self, stop_event=None) -> None:
         """Poll the configuration's schedules until stopped."""
+        LOGGER.info("Worker polling every %s seconds", self.poll_interval)
         while stop_event is None or not stop_event.is_set():
             self.run_once()
             if stop_event is None:
@@ -376,6 +410,7 @@ class ConfigWorker:
             name="simplepipeline-config-worker",
         )
         self._process.start()
+        LOGGER.info("Started worker process (pid %s)", self._process.pid)
 
     def stop(self, timeout: float | None = None) -> bool:
         """Request a graceful stop and return whether the process stopped."""
@@ -383,6 +418,8 @@ class ConfigWorker:
             return True
         self._stop_event.set()
         self._process.join(timeout)
+        if not self._process.is_alive():
+            LOGGER.info("Worker process stopped (exit code %s)", self._process.exitcode)
         return not self._process.is_alive()
 
     def join(self, timeout: float | None = None) -> int | None:
@@ -394,6 +431,10 @@ class ConfigWorker:
 
 
 def _run_config_process(config_path: str, stop_event) -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
     try:
         ConfigWorker(config_path).run_forever(stop_event)
     except KeyboardInterrupt:

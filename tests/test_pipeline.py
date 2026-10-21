@@ -1,9 +1,11 @@
 from datetime import datetime, timedelta, timezone
+import json
 import sqlite3
 import sys
 from threading import Event, Thread
 import time
 import types
+from urllib.request import urlopen
 
 import pytest
 
@@ -15,6 +17,7 @@ from simplepipeline import (
     Product,
 )
 from simplepipeline.config import _run_config_process
+from simplepipeline.dashboard import DashboardServer
 from simplepipeline.engine import daily_utc_candidates
 from simplepipeline.models import semantic_version_key
 from simplepipeline.rules import SameTimestampRule
@@ -302,7 +305,10 @@ def test_daily_worker_starts_and_stops_in_a_separate_process(tmp_path):
     assert worker.join(timeout=0) == 0
 
 
-def test_config_worker_triggers_when_registered_inputs_share_timestamp(tmp_path, monkeypatch):
+def test_config_worker_triggers_when_registered_inputs_share_timestamp(
+    tmp_path, monkeypatch, caplog
+):
+    caplog.set_level("INFO")
     calls = []
     processor_module = types.ModuleType("test_processors")
     processor_module.process = lambda inputs, output_time: (
@@ -326,6 +332,7 @@ def test_config_worker_triggers_when_registered_inputs_share_timestamp(tmp_path,
         ("L1", "2.0.0"),
         ("L1B", "0.0.0"),
     ]
+    assert "Completed candidate combine at" in caplog.text
 
 
 def test_config_worker_runs_and_persists_fixed_interval_schedule(tmp_path, monkeypatch):
@@ -501,3 +508,35 @@ def test_config_worker_process_handles_keyboard_interrupt(monkeypatch):
     monkeypatch.setattr(ConfigWorker, "__init__", lambda self, config_path: None)
     monkeypatch.setattr(ConfigWorker, "run_forever", interrupt)
     _run_config_process("unused.toml", None)
+
+
+def test_dashboard_serves_recent_pipeline_status(tmp_path):
+    pipeline = Pipeline(tmp_path / "pipeline.sqlite3")
+    rule = SameTimestampRule("combine", "L1", "L2")
+    pipeline.run_candidate(rule, END - timedelta(seconds=1), _worker_processor)
+    pipeline.add_product(Product("L1", END, "/inputs/current"))
+    pipeline.run_candidate(rule, END, _worker_processor)
+
+    dashboard = DashboardServer(pipeline.database, port=0)
+    dashboard.start()
+    try:
+        host, port = dashboard.address
+        with urlopen(f"http://{host}:{port}/api/status") as response:
+            status = json.loads(response.read())
+        with urlopen(f"http://{host}:{port}/") as response:
+            page = response.read().decode()
+    finally:
+        dashboard.close()
+
+    assert status["summary"] == {
+        "pending": 1,
+        "processing": 0,
+        "complete": 1,
+        "failed": 0,
+    }
+    assert [item["status"] for item in status["candidates"]] == [
+        "complete",
+        "pending",
+    ]
+    assert status["products"][0]["product_code"] == "L2"
+    assert "<title>simplepipeline dashboard</title>" in page
