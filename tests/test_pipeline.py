@@ -5,6 +5,8 @@ import sys
 from threading import Event, Thread
 import time
 import types
+from urllib.error import HTTPError
+from urllib.parse import urlencode
 from urllib.request import urlopen
 
 import pytest
@@ -600,6 +602,14 @@ def test_dashboard_serves_recent_pipeline_status(tmp_path, caplog):
             status = json.loads(response.read())
         with urlopen(f"http://{host}:{port}/api/status?refresh=1") as response:
             assert response.status == 200
+        window_query = urlencode(
+            {"start": END.isoformat(), "end": END.isoformat()}
+        )
+        with urlopen(f"http://{host}:{port}/api/status?{window_query}") as response:
+            filtered_status = json.loads(response.read())
+        with pytest.raises(HTTPError) as error:
+            urlopen(f"http://{host}:{port}/api/status?start=not-a-timestamp")
+        assert error.value.code == 400
         with urlopen(f"http://{host}:{port}/") as response:
             page = response.read().decode()
     finally:
@@ -618,4 +628,19 @@ def test_dashboard_serves_recent_pipeline_status(tmp_path, caplog):
     assert [item["attempts"] for item in status["candidates"]] == [1, 0]
     assert status["products"][0]["product_code"] == "L2"
     assert "<title>simplepipeline dashboard</title>" in page
-    assert "Dashboard: " not in caplog.text
+    assert 'id="start-time"' in page
+    assert len(filtered_status["candidates"]) == 1
+    assert filtered_status["candidates"][0]["timestamp"] == END.isoformat(
+        timespec="microseconds"
+    ).replace("+00:00", "Z")
+    assert filtered_status["summary"] == {
+        "pending": 0,
+        "processing": 0,
+        "complete": 1,
+        "failed": 0,
+    }
+    assert {product["product_code"] for product in filtered_status["products"]} == {
+        "L1",
+        "L2",
+    }
+    assert '"GET ' not in caplog.text

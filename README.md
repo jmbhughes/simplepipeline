@@ -60,7 +60,10 @@ python -m simplepipeline pipeline.toml --dashboard
 The dashboard refreshes automatically at `http://127.0.0.1:8765`. Choose a
 different port with `--dashboard-port 9000`. It binds to localhost by default;
 to expose it to other machines, pass `--dashboard-host 0.0.0.0` and ensure the
-host firewall and network are appropriately restricted.
+host firewall and network are appropriately restricted. Use the optional start
+and end time fields to filter candidate and product timestamps inclusively; leave
+either field blank for an open-ended range, or clear both to show all data.
+Times are entered in the browser's local timezone.
 
 The example [`pipeline.toml`](./pipeline.toml) configures an L2 function that
 creates an output at each registered L1 timestamp. Its processor,

@@ -4,10 +4,12 @@ import json
 import logging
 import sqlite3
 import threading
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
+from .models import normalize_timestamp, timestamp_text
 
 LOGGER = logging.getLogger(__name__)
 
@@ -25,6 +27,9 @@ _DASHBOARD_HTML = """<!doctype html>
     .summary { display: flex; flex-wrap: wrap; gap: .75rem; margin: 1.5rem 0; }
     .card { border: 1px solid #8886; border-radius: 8px; padding: .8rem 1rem; min-width: 100px; }
     .card strong { display: block; font-size: 1.5rem; }
+    .filters { display: flex; flex-wrap: wrap; align-items: end; gap: .75rem; margin-top: 1.25rem; }
+    .filters label { display: grid; gap: .25rem; }
+    button { padding: .45rem .75rem; }
     section { margin: 2rem 0; }
     .table-wrap { overflow-x: auto; }
     table { border-collapse: collapse; width: 100%; }
@@ -38,6 +43,12 @@ _DASHBOARD_HTML = """<!doctype html>
 <body>
   <h1>simplepipeline</h1>
   <div class="muted" id="updated">Loading status…</div>
+  <form class="filters" id="time-window">
+    <label>Start time <input type="datetime-local" id="start-time"></label>
+    <label>End time <input type="datetime-local" id="end-time"></label>
+    <button type="submit">Apply window</button>
+    <button type="button" id="clear-window">Clear</button>
+  </form>
   <div class="summary" id="summary"></div>
   <section>
     <h2>Recent candidates</h2>
@@ -60,9 +71,28 @@ _DASHBOARD_HTML = """<!doctype html>
       if (className) node.className = className;
       return node;
     };
+    const startInput = document.getElementById("start-time");
+    const endInput = document.getElementById("end-time");
+    let timeWindow = {start: "", end: ""};
+    document.getElementById("time-window").addEventListener("submit", event => {
+      event.preventDefault();
+      timeWindow = {start: startInput.value, end: endInput.value};
+      refresh();
+    });
+    document.getElementById("clear-window").addEventListener("click", () => {
+      startInput.value = "";
+      endInput.value = "";
+      timeWindow = {start: "", end: ""};
+      refresh();
+    });
+    const toUtc = value => value ? new Date(value).toISOString() : "";
     async function refresh() {
       try {
-        const response = await fetch("/api/status", {cache: "no-store"});
+        const params = new URLSearchParams();
+        if (timeWindow.start) params.set("start", toUtc(timeWindow.start));
+        if (timeWindow.end) params.set("end", toUtc(timeWindow.end));
+        const query = params.toString();
+        const response = await fetch(`/api/status${query ? `?${query}` : ""}`, {cache: "no-store"});
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         const data = await response.json();
         document.getElementById("updated").textContent =
@@ -107,21 +137,62 @@ _DASHBOARD_HTML = """<!doctype html>
 """
 
 
-def read_dashboard_status(database: str) -> dict[str, Any]:
+def _parse_time_bound(value: str | None, parameter: str) -> str | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return timestamp_text(normalize_timestamp(parsed))
+    except ValueError as error:
+        raise ValueError(
+            f"{parameter} must be an ISO-8601 timestamp with a timezone"
+        ) from error
+
+
+def read_dashboard_status(
+    database: str, *, start: str | None = None, end: str | None = None
+) -> dict[str, Any]:
+    start_time = _parse_time_bound(start, "start")
+    end_time = _parse_time_bound(end, "end")
+    if start_time is not None and end_time is not None and start_time > end_time:
+        raise ValueError("start must not be later than end")
+
+    candidate_filters = []
+    product_filters = []
+    parameters: list[str] = []
+    if start_time is not None:
+        candidate_filters.append("timestamp >= ?")
+        product_filters.append("timestamp >= ?")
+        parameters.append(start_time)
+    if end_time is not None:
+        candidate_filters.append("timestamp <= ?")
+        product_filters.append("timestamp <= ?")
+        parameters.append(end_time)
+    candidate_where = (
+        f" WHERE {' AND '.join(candidate_filters)}" if candidate_filters else ""
+    )
+    product_where = (
+        f" WHERE {' AND '.join(product_filters)}" if product_filters else ""
+    )
+
     with sqlite3.connect(database, timeout=5) as connection:
         connection.row_factory = sqlite3.Row
         counts = connection.execute(
             "SELECT status, claim_token, COUNT(*) AS count "
-            "FROM candidates GROUP BY status, claim_token"
+            f"FROM candidates{candidate_where} GROUP BY status, claim_token",
+            parameters,
         ).fetchall()
         candidates = connection.execute(
             "SELECT rule_name, output_product_code, timestamp, status, error, "
-            "claim_token, attempts "
-            "FROM candidates ORDER BY timestamp DESC, id DESC LIMIT 100"
+            "claim_token, attempts FROM candidates"
+            f"{candidate_where} ORDER BY timestamp DESC, id DESC LIMIT 100",
+            parameters,
         ).fetchall()
         products = connection.execute(
             "SELECT product_code, version, timestamp, path "
-            "FROM products ORDER BY created_at DESC, id DESC LIMIT 100"
+            f"FROM products{product_where} "
+            "ORDER BY created_at DESC, id DESC LIMIT 100",
+            parameters,
         ).fetchall()
 
     summary = {"pending": 0, "processing": 0, "complete": 0, "failed": 0}
@@ -162,7 +233,17 @@ class DashboardServer:
                     content_type = "text/html; charset=utf-8"
                 elif route == "/api/status":
                     try:
-                        body = json.dumps(read_dashboard_status(database_path)).encode("utf-8")
+                        query = parse_qs(urlsplit(self.path).query)
+                        body = json.dumps(
+                            read_dashboard_status(
+                                database_path,
+                                start=query.get("start", [None])[0],
+                                end=query.get("end", [None])[0],
+                            )
+                        ).encode("utf-8")
+                    except ValueError as error:
+                        self.send_error(400, str(error))
+                        return
                     except sqlite3.Error:
                         LOGGER.exception("Unable to read pipeline status for dashboard")
                         self.send_error(500, "Unable to read pipeline status")
