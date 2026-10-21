@@ -6,6 +6,7 @@ import sqlite3
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
+from urllib.parse import urlsplit
 
 
 LOGGER = logging.getLogger(__name__)
@@ -155,10 +156,11 @@ class DashboardServer:
 
         class DashboardHandler(BaseHTTPRequestHandler):
             def do_GET(self) -> None:
-                if self.path == "/":
+                route = urlsplit(self.path).path
+                if route == "/":
                     body = _DASHBOARD_HTML.encode("utf-8")
                     content_type = "text/html; charset=utf-8"
-                elif self.path == "/api/status":
+                elif route == "/api/status":
                     try:
                         body = json.dumps(read_dashboard_status(database_path)).encode("utf-8")
                     except sqlite3.Error:
@@ -177,9 +179,14 @@ class DashboardServer:
                 self.end_headers()
                 self.wfile.write(body)
 
-            def log_message(self, format: str, *args: object) -> None:
-                if self.command == "GET" and self.path == "/api/status":
+            def log_request(
+                self, code: int | str = "-", size: int | str = "-"
+            ) -> None:
+                if self.command == "GET":
                     return
+                super().log_request(code, size)
+
+            def log_message(self, format: str, *args: object) -> None:
                 LOGGER.debug("Dashboard: " + format, *args)
 
         self._server = ThreadingHTTPServer((host, port), DashboardHandler)

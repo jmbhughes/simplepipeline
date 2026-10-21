@@ -588,6 +588,8 @@ def test_dashboard_serves_recent_pipeline_status(tmp_path, caplog):
         host, port = dashboard.address
         with urlopen(f"http://{host}:{port}/api/status") as response:
             status = json.loads(response.read())
+        with urlopen(f"http://{host}:{port}/api/status?refresh=1") as response:
+            assert response.status == 200
         with urlopen(f"http://{host}:{port}/") as response:
             page = response.read().decode()
     finally:
@@ -606,4 +608,4 @@ def test_dashboard_serves_recent_pipeline_status(tmp_path, caplog):
     assert [item["attempts"] for item in status["candidates"]] == [1, 0]
     assert status["products"][0]["product_code"] == "L2"
     assert "<title>simplepipeline dashboard</title>" in page
-    assert "/api/status" not in caplog.text
+    assert "Dashboard: " not in caplog.text
