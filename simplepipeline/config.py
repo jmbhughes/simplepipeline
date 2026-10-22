@@ -41,7 +41,6 @@ class _ConfiguredFunction:
     rule: ScheduledRule
     processor: Processor
     cadence_type: str
-    output_version: str = "0.0.0"
     trigger_product: str | None = None
     interval: timedelta | None = None
     start_at: datetime | None = None
@@ -217,6 +216,10 @@ class ConfigWorker:
         worker_settings = settings.get("worker", {})
         if not isinstance(worker_settings, dict):
             raise ValueError("[worker] must be a TOML table")
+        self.output_version = worker_settings.get("output_version", "0.0.0")
+        if not isinstance(self.output_version, str):
+            raise ValueError("worker.output_version must be a string")
+        semantic_version_key(self.output_version)
         database_setting = worker_settings.get("database", "pipeline.sqlite3")
         if not isinstance(database_setting, str):
             raise ValueError("worker.database must be a path string")
@@ -280,10 +283,11 @@ class ConfigWorker:
             if not isinstance(processor_reference, str):
                 raise ValueError(f"function {name!r} must declare processor = 'module:function'")
             processor = _load_processor(processor_reference, self.config_path.parent)
-            output_version = function_settings.get("output_version", "0.0.0")
-            if not isinstance(output_version, str):
-                raise ValueError(f"function {name!r} output_version must be a string")
-            semantic_version_key(output_version)
+            if "output_version" in function_settings:
+                raise ValueError(
+                    f"function {name!r} output_version is no longer supported; "
+                    "set [worker].output_version instead"
+                )
             cadence = function_settings.get("cadence")
             if not isinstance(cadence, dict):
                 raise ValueError(f"function {name!r} must declare a [functions.{name}.cadence] table")
@@ -299,7 +303,6 @@ class ConfigWorker:
                         rule,
                         processor,
                         cadence_type,
-                        output_version=output_version,
                         trigger_product=trigger_product,
                         product_discovery=product_discovery,
                     )
@@ -322,7 +325,6 @@ class ConfigWorker:
                         rule,
                         processor,
                         cadence_type,
-                        output_version=output_version,
                         interval=interval,
                         start_at=start_at,
                         product_discovery=product_discovery,
@@ -366,7 +368,6 @@ class ConfigWorker:
                         rule,
                         processor,
                         cadence_type,
-                        output_version=output_version,
                         trigger_product=trigger_product,
                         sensor_directory=directory.resolve(),
                         sensor_extension=extension,
@@ -480,7 +481,7 @@ class ConfigWorker:
                         rule,
                         candidate_time,
                         function.processor,
-                        output_version=function.output_version,
+                        output_version=self.output_version,
                         product_discovery=function.product_discovery,
                         claim_timeout=self.claim_timeout,
                         max_attempts=self.max_attempts,

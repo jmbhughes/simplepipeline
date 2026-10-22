@@ -61,6 +61,7 @@ Configure the retry limit in the TOML `[worker]` table:
 [worker]
 max_attempts = 3
 max_workers = 2
+output_version = "1.2.0"
 ```
 
 `max_attempts` is the maximum total number of processing attempts for a
@@ -77,6 +78,12 @@ workers can process different candidates concurrently; SQLite claims prevent
 them from processing the same candidate at the same time. Configure processors
 to be safe when invoked concurrently, and account for the extra CPU and memory
 use.
+
+`output_version` is a global SemVer setting for generated outputs and defaults
+to `0.0.0`. It applies to all configured functions that use the processor's
+returned output path. Set it in `[worker]`; per-function `output_version`
+settings are not supported. When using `discover_products`, each discovered
+`Product.version` continues to determine that product's version.
 
 The worker logs startup, sensor-file registration, completed candidates, and
 failures to the terminal. Add `--verbose` to include debug messages such as
@@ -210,9 +217,10 @@ pass `version="1.2.0"` to `Product`; window-rule selection
 ignores older versions for that product code, even if an older-version file has
 a timestamp that the newest version does not. Build metadata follows SemVer
 precedence and is used only to break ties deterministically. Single-path
-generated outputs use `output_version` from TOML or the `run_candidate` keyword
-argument, defaulting to `0.0.0`. With `discover_products`, each discovered
-`Product.version` determines its output version. Interval candidates are
+generated outputs use the global `output_version` from `[worker]` or the
+`run_candidate` keyword argument, defaulting to `0.0.0`. With
+`discover_products`, each discovered `Product.version` determines its output
+version. Interval candidates are
 anchored at `start_at`; missed intervals are scheduled on restart, and the next
 interval cursor is persisted in SQLite.
 Incomplete candidates are retried each poll for every cadence. The worker uses

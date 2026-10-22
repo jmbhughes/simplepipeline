@@ -62,14 +62,14 @@ def _write_config(
         f'''[worker]
 database = "worker.sqlite3"
 poll_interval_seconds = 1
-{max_workers_setting}
+        output_version = "{output_version}"
+        {max_workers_setting}
 
 [functions.combine]
 inputs = ["L1", "L1B"]
 output = "L2"
 rule = "same_timestamp"
 processor = "{processor}"
-output_version = "{output_version}"
 
 [functions.combine.cadence]
 {cadence}
@@ -1485,6 +1485,14 @@ def test_rule_configuration_validation(settings, message):
         (
             '[worker]\ndatabase = 1\n' + _base_config_text(),
             "database",
+        ),
+        (
+            '[worker]\noutput_version = 3\n' + _base_config_text(),
+            "worker.output_version",
+        ),
+        (
+            '[worker]\noutput_version = "invalid"\n' + _base_config_text(),
+            "semantic version",
         ),
         ('[worker]\nmax_attempts = 0\n' + _base_config_text(), "max_attempts"),
         ('[worker]\nmax_workers = 0\n' + _base_config_text(), "max_workers"),

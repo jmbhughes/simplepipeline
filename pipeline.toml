@@ -3,11 +3,11 @@ database = "pipeline.sqlite3"
 poll_interval_seconds = 30
 claim_timeout_seconds = 86400
 max_attempts = 3
+output_version = "0.0.0"
 
 [functions.l2]
 output = "L2"
 processor = "demo:make_l2"
-output_version = "0.0.0"
 
 [[functions.l2.rules]]
 type = "same_timestamp"
