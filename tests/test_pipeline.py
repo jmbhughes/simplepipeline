@@ -290,6 +290,7 @@ def test_existing_database_migrates_versions_without_losing_provenance(tmp_path)
 
     pipeline = Pipeline(database)
     assert pipeline.candidate_inputs("legacy", END)[0].version == "0.0.0"
+    assert pipeline.candidate_outputs("legacy", END)[0].path == "/inputs/legacy"
     pipeline.add_product(
         Product("L1", END, "/inputs/v2", version="2.0.0")
     )
@@ -567,6 +568,53 @@ product = "L1"
         "/inputs/l1",
         "/inputs/l1b-early",
         "/inputs/l1b-late",
+    ]
+
+
+def test_config_worker_discovers_products_without_declaring_output(
+    tmp_path, monkeypatch
+):
+    calls = []
+    processor_module = types.ModuleType("discovery_processors")
+
+    def process(inputs, output_time):
+        calls.append(("process", output_time))
+
+    def discover(inputs, output_time):
+        calls.append(("discover", output_time))
+        return [
+            Product("CAL", output_time, "/outputs/calibration.fits"),
+            Product("MASK", output_time, "/outputs/mask.fits"),
+        ]
+
+    processor_module.process = process
+    processor_module.discover = discover
+    monkeypatch.setitem(sys.modules, "discovery_processors", processor_module)
+    config_path = tmp_path / "pipeline.toml"
+    config_path.write_text(
+        '''[worker]
+database = "worker.sqlite3"
+
+[functions.discovery]
+processor = "discovery_processors:process"
+discover_products = "discovery_processors:discover"
+rule = "same_timestamp"
+inputs = ["RAW"]
+
+[functions.discovery.cadence]
+type = "on_input"
+product = "RAW"
+'''
+    )
+    worker = ConfigWorker(config_path)
+    pipeline = Pipeline(tmp_path / "worker.sqlite3")
+    pipeline.add_product(Product("RAW", END, "/inputs/raw"))
+
+    assert worker.run_once(END) == {("discovery", END): "complete"}
+    assert calls == [("process", END), ("discover", END)]
+    assert [product.product_code for product in pipeline.candidate_outputs("discovery", END)] == [
+        "CAL",
+        "MASK",
     ]
 
 
@@ -959,6 +1007,69 @@ def test_candidate_reuses_existing_output_product(tmp_path):
     ) == "complete"
     assert pipeline.products("L2") == [output]
     assert pipeline.candidate_inputs("existing-output", END)[0].product_code == "L1"
+    assert pipeline.candidate_outputs("existing-output", END) == [output]
+
+
+def test_candidate_registers_many_discovered_products(tmp_path):
+    pipeline = Pipeline(tmp_path / "pipeline.sqlite3")
+    rule = SameTimestampRule("many-outputs", "L1", "dynamic")
+    pipeline.add_product(Product("L1", END, "/inputs/one"))
+    output_time = END + timedelta(seconds=1)
+    outputs = [
+        Product("CAL", output_time, "/outputs/calibration.fits", version="1.2.0"),
+        Product("MASK", END, "/outputs/mask.fits"),
+    ]
+
+    assert pipeline.run_candidate(
+        rule,
+        END,
+        lambda inputs, timestamp: None,
+        product_discovery=lambda inputs, timestamp: outputs,
+    ) == "complete"
+    assert pipeline.candidate_outputs("many-outputs", END) == [
+        Product("CAL", output_time, "/outputs/calibration.fits", 2, "1.2.0"),
+        Product("MASK", END, "/outputs/mask.fits", 3),
+    ]
+    assert [product.path for product in pipeline.candidate_inputs("many-outputs", END)] == [
+        "/inputs/one"
+    ]
+    assert pipeline.candidate_status("many-outputs", END) == "complete"
+
+
+def test_candidate_can_complete_with_no_discovered_products(tmp_path):
+    pipeline = Pipeline(tmp_path / "pipeline.sqlite3")
+    rule = SameTimestampRule("no-outputs", "L1", "dynamic")
+    pipeline.add_product(Product("L1", END, "/inputs/one"))
+
+    assert pipeline.run_candidate(
+        rule,
+        END,
+        lambda inputs, timestamp: None,
+        product_discovery=lambda inputs, timestamp: [],
+    ) == "complete"
+    assert pipeline.candidate_outputs("no-outputs", END) == []
+    assert pipeline.candidate_status("no-outputs", END) == "complete"
+
+
+def test_discovery_failure_registers_no_outputs(tmp_path):
+    pipeline = Pipeline(tmp_path / "pipeline.sqlite3")
+    rule = SameTimestampRule("discovery-fails", "L1", "dynamic")
+    pipeline.add_product(Product("L1", END, "/inputs/one"))
+
+    def discover(inputs, timestamp):
+        yield Product("CAL", timestamp, "/outputs/calibration.fits")
+        raise RuntimeError("failed to inspect outputs")
+
+    with pytest.raises(RuntimeError, match="failed to inspect outputs"):
+        pipeline.run_candidate(
+            rule,
+            END,
+            lambda inputs, timestamp: None,
+            product_discovery=discover,
+        )
+    assert pipeline.products("CAL") == []
+    assert pipeline.candidate_outputs("discovery-fails", END) == []
+    assert pipeline.candidate_status("discovery-fails", END) == "failed"
 
 
 def test_product_timestamps_excludes_completed_and_exhausted_candidates(tmp_path):

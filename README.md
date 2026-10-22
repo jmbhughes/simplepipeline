@@ -15,6 +15,34 @@ function's selection rule and calls its `module:function` processor. Successful
 outputs and their exact input provenance are recorded in the database; jobs
 without enough inputs are retried on later polls.
 
+When the processor can create a variable number of products, configure a
+separate `discover_products = "module:function"` callback. It receives the
+selected inputs and candidate timestamp after processing and returns an
+iterable of `Product` records describing the outputs it finds. The callback
+owns the function-specific logic for locating and interpreting those outputs;
+simplepipeline validates and registers the returned products. An empty iterable
+is valid and marks the candidate complete with no outputs. In this mode, each
+discovered `Product` supplies its own product code, timestamp, path, and
+version, and the function's `output` setting may be omitted.
+
+```toml
+[functions.calibration]
+processor = "my_processing:run_calibration"
+discover_products = "my_processing:discover_calibration_products"
+rule = "same_timestamp"
+inputs = ["RAW"]
+
+[functions.calibration.cadence]
+type = "on_input"
+product = "RAW"
+```
+
+The processor may return any value when `discover_products` is configured. The
+discovery callback is called only after processing succeeds; if discovery
+raises or returns an invalid product, no discovered outputs are registered and
+the candidate fails. Use a dedicated output location or another reliable
+run-specific way to distinguish newly generated files from pre-existing ones.
+
 ## Configuration-driven worker
 
 Pipeline functions, product codes, processor references, and cadence can be
@@ -168,12 +196,19 @@ until at least `count` eligible inputs are available. When registering files,
 pass `version="1.2.0"` to `Product`; the chooser
 ignores older versions for that product code, even if an older-version file has
 a timestamp that the newest version does not. Build metadata follows SemVer
-precedence and is used only to break ties deterministically. Generated outputs
-use `output_version` from TOML or the `run_candidate` keyword argument, defaulting
-to `0.0.0`. Interval candidates are anchored at `start_at`; missed intervals are
-scheduled on restart, and the next interval cursor is persisted in SQLite.
+precedence and is used only to break ties deterministically. Single-path
+generated outputs use `output_version` from TOML or the `run_candidate` keyword
+argument, defaulting to `0.0.0`. With `discover_products`, each discovered
+`Product.version` determines its output version. Interval candidates are
+anchored at `start_at`; missed intervals are scheduled on restart, and the next
+interval cursor is persisted in SQLite.
 Incomplete candidates are retried each poll for every cadence. The worker uses
 Python's `spawn` mode and runs until stopped with Ctrl+C.
+
+Programmatic callers can retrieve products associated with a candidate using
+`Pipeline.candidate_outputs(rule_name, output_timestamp)`. This returns an empty
+list both when no candidate exists and when a successful discovery found no
+products; check `candidate_status` to distinguish those cases.
 
 The existing programmatic `DailyWorker` API remains available for daily
 midnight-UTC schedules. Its processing claim expires after one day by default;

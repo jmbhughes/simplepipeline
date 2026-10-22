@@ -8,7 +8,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Iterable, cast
 
 try:
     import tomllib
@@ -31,7 +31,8 @@ from .rules import (
 
 
 LOGGER = logging.getLogger(__name__)
-Processor = Callable[[list[Product], datetime], str]
+Processor = Callable[[list[Product], datetime], object]
+ProductDiscovery = Callable[[list[Product], datetime], Iterable[Product]]
 
 
 @dataclass(frozen=True)
@@ -46,6 +47,7 @@ class _ConfiguredFunction:
     sensor_directory: Path | None = None
     sensor_extension: str | None = None
     product_factory: Callable[[Path], Product] | None = None
+    product_discovery: ProductDiscovery | None = None
 
 
 def _parse_timestamp(value: str, setting: str) -> datetime:
@@ -74,6 +76,30 @@ def _load_processor(reference: str, config_directory: Path) -> Processor:
     if not callable(processor):
         raise ValueError(f"processor {reference!r} does not identify a callable")
     return processor
+
+
+def _load_product_discovery(
+    reference: str, config_directory: Path
+) -> ProductDiscovery:
+    try:
+        module_name, function_name = reference.split(":", maxsplit=1)
+    except ValueError as error:
+        raise ValueError(
+            "discover_products must use the 'module:function' format: "
+            f"{reference!r}"
+        ) from error
+    if not module_name or not function_name:
+        raise ValueError(f"invalid product discovery reference: {reference!r}")
+    directory = str(config_directory)
+    if directory not in sys.path:
+        sys.path.insert(0, directory)
+    module = importlib.import_module(module_name)
+    discovery = getattr(module, function_name, None)
+    if not callable(discovery):
+        raise ValueError(
+            f"product discovery {reference!r} does not identify a callable"
+        )
+    return cast(ProductDiscovery, discovery)
 
 
 def _load_product_factory(
@@ -149,8 +175,12 @@ def _make_single_rule(
     )
 
 
-def _make_rule(name: str, settings: dict) -> ScheduledRule:
+def _make_rule(
+    name: str, settings: dict, *, dynamic_output: bool = False
+) -> ScheduledRule:
     output_code = settings.get("output")
+    if output_code is None and dynamic_output:
+        output_code = "dynamic"
     if not isinstance(output_code, str):
         raise ValueError(f"function {name!r} must declare an output product code")
     if "rules" not in settings:
@@ -219,7 +249,26 @@ class ConfigWorker:
         for name, function_settings in functions.items():
             if not isinstance(function_settings, dict):
                 raise ValueError(f"function {name!r} must be a TOML table")
-            rule = _make_rule(name, function_settings)
+            discovery_reference = function_settings.get("discover_products")
+            if discovery_reference is not None and not isinstance(
+                discovery_reference, str
+            ):
+                raise ValueError(
+                    f"function {name!r} discover_products must be a "
+                    "'module:function' reference"
+                )
+            product_discovery = (
+                _load_product_discovery(
+                    discovery_reference, self.config_path.parent
+                )
+                if discovery_reference is not None
+                else None
+            )
+            rule = _make_rule(
+                name,
+                function_settings,
+                dynamic_output=product_discovery is not None,
+            )
             processor_reference = function_settings.get("processor")
             if not isinstance(processor_reference, str):
                 raise ValueError(f"function {name!r} must declare processor = 'module:function'")
@@ -245,6 +294,7 @@ class ConfigWorker:
                         cadence_type,
                         output_version=output_version,
                         trigger_product=trigger_product,
+                        product_discovery=product_discovery,
                     )
                 )
             elif cadence_type == "interval":
@@ -268,6 +318,7 @@ class ConfigWorker:
                         output_version=output_version,
                         interval=interval,
                         start_at=start_at,
+                        product_discovery=product_discovery,
                     )
                 )
             elif cadence_type == "sensor":
@@ -315,6 +366,7 @@ class ConfigWorker:
                         product_factory=_load_product_factory(
                             factory_reference, self.config_path.parent
                         ),
+                        product_discovery=product_discovery,
                     )
                 )
             else:
@@ -422,6 +474,7 @@ class ConfigWorker:
                         candidate_time,
                         function.processor,
                         output_version=function.output_version,
+                        product_discovery=function.product_discovery,
                         claim_timeout=self.claim_timeout,
                         max_attempts=self.max_attempts,
                     )

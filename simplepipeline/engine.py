@@ -72,6 +72,13 @@ class Pipeline:
                     PRIMARY KEY(candidate_id, ordinal),
                     UNIQUE(candidate_id, product_id)
                 );
+                CREATE TABLE IF NOT EXISTS candidate_outputs (
+                    candidate_id INTEGER NOT NULL REFERENCES candidates(id) ON DELETE CASCADE,
+                    product_id INTEGER NOT NULL REFERENCES products(id),
+                    ordinal INTEGER NOT NULL,
+                    PRIMARY KEY(candidate_id, ordinal),
+                    UNIQUE(candidate_id, product_id)
+                );
                 """
             )
             product_columns = {
@@ -110,6 +117,11 @@ class Pipeline:
                 db.execute(
                     "ALTER TABLE candidates ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0"
                 )
+            db.execute(
+                "INSERT OR IGNORE INTO candidate_outputs(candidate_id, product_id, ordinal) "
+                "SELECT id, output_product_id, 0 FROM candidates "
+                "WHERE output_product_id IS NOT NULL"
+            )
 
     def add_product(self, product: Product) -> Product:
         created_at = timestamp_text(datetime.now(timezone.utc))
@@ -181,18 +193,23 @@ class Pipeline:
         self,
         rule: ScheduledRule,
         output_timestamp: datetime,
-        processor: Callable[[list[Product], datetime], str],
+        processor: Callable[[list[Product], datetime], object],
         *,
+        product_discovery: Callable[
+            [list[Product], datetime], Iterable[Product]
+        ] | None = None,
         output_version: str = "0.0.0",
         claim_timeout: timedelta = timedelta(days=1),
         max_attempts: int = 3,
     ) -> str:
         """Attempt a scheduled output once; pending candidates may be retried.
 
-        The processor receives the selected immutable input set and output time,
-        and must return the output file path. Existing completed outputs are never
-        recomputed when additional inputs arrive. A candidate claimed by another
-        worker is left alone until its claim expires.
+        The processor receives the selected input set and output time. Without a
+        discovery callback it must return one output file path; with a discovery
+        callback, that callback returns the products created by the processor.
+        Existing completed outputs are never recomputed when additional inputs
+        arrive. A candidate claimed by another worker is left alone until its
+        claim expires.
         """
         if claim_timeout <= timedelta(0):
             raise ValueError("claim_timeout must be positive")
@@ -275,9 +292,35 @@ class Pipeline:
             )
 
         try:
-            output_path = processor(selected, output_timestamp)
-            if not output_path:
-                raise ValueError("processor must return a non-empty output path")
+            processor_result = processor(selected, output_timestamp)
+            if product_discovery is None:
+                if not isinstance(processor_result, str) or not processor_result:
+                    raise ValueError("processor must return a non-empty output path")
+                output_products = [
+                    Product(
+                        rule.output_product_code,
+                        output_timestamp,
+                        processor_result,
+                        version=output_version,
+                    )
+                ]
+            else:
+                discovered = tuple(product_discovery(selected, output_timestamp))
+                if any(not isinstance(product, Product) for product in discovered):
+                    raise TypeError("product discovery must return only Product instances")
+                if any(product.product_id is not None for product in discovered):
+                    raise ValueError(
+                        "products returned by product discovery cannot have a product_id"
+                    )
+                identities = [
+                    (product.product_code, product.timestamp, product.version)
+                    for product in discovered
+                ]
+                if len(set(identities)) != len(identities):
+                    raise ValueError(
+                        "product discovery returned duplicate product identities"
+                    )
+                output_products = list(discovered)
         except Exception as error:
             with self._connect() as db:
                 db.execute(
@@ -294,32 +337,54 @@ class Pipeline:
                 ).fetchone()
                 if claim is None or claim["claim_token"] != claim_token:
                     raise RuntimeError("candidate processing claim expired before completion")
-                existing = db.execute(
-                    "SELECT id FROM products WHERE product_code = ? AND timestamp = ? AND version = ?",
-                    (rule.output_product_code, timestamp, output_version),
-                ).fetchone()
-                if existing:
-                    output_id = int(existing["id"])
-                else:
-                    cursor = db.execute(
-                        "INSERT INTO products(product_code, timestamp, path, version, created_at) "
-                        "VALUES (?, ?, ?, ?, ?)",
+                output_ids: list[int] = []
+                for ordinal, product in enumerate(output_products):
+                    product_timestamp = timestamp_text(product.timestamp)
+                    existing = db.execute(
+                        "SELECT id, path FROM products "
+                        "WHERE product_code = ? AND timestamp = ? AND version = ?",
                         (
-                            rule.output_product_code,
-                            timestamp,
-                            output_path,
-                            output_version,
-                            timestamp_text(datetime.now(timezone.utc)),
+                            product.product_code,
+                            product_timestamp,
+                            product.version,
                         ),
+                    ).fetchone()
+                    if existing:
+                        if (
+                            product_discovery is not None
+                            and existing["path"] != product.path
+                        ):
+                            raise ValueError(
+                                f"product {product.product_code} at "
+                                f"{product_timestamp} already exists at {existing['path']}"
+                            )
+                        output_id = int(existing["id"])
+                    else:
+                        cursor = db.execute(
+                            "INSERT INTO products(product_code, timestamp, path, version, created_at) "
+                            "VALUES (?, ?, ?, ?, ?)",
+                            (
+                                product.product_code,
+                                product_timestamp,
+                                product.path,
+                                product.version,
+                                timestamp_text(datetime.now(timezone.utc)),
+                            ),
+                        )
+                        output_id = int(cursor.lastrowid)
+                    output_ids.append(output_id)
+                    db.execute(
+                        "INSERT INTO candidate_outputs(candidate_id, product_id, ordinal) "
+                        "VALUES (?, ?, ?)",
+                        (candidate_id, output_id, ordinal),
                     )
-                    output_id = int(cursor.lastrowid)
                 db.executemany(
                     "INSERT INTO candidate_inputs(candidate_id, product_id, ordinal) VALUES (?, ?, ?)",
                     [(candidate_id, product.product_id, i) for i, product in enumerate(selected)],
                 )
                 db.execute(
                     "UPDATE candidates SET status = 'complete', output_product_id = ?, error = NULL, claim_token = NULL, claimed_at = NULL WHERE id = ?",
-                    (output_id, candidate_id),
+                    (output_ids[0] if output_ids else None, candidate_id),
                 )
                 return "complete"
         except Exception as error:
@@ -329,6 +394,30 @@ class Pipeline:
                     (str(error), candidate_id, claim_token),
                 )
             raise
+
+    def candidate_outputs(self, rule_name: str, output_timestamp: datetime) -> list[Product]:
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT id FROM candidates WHERE rule_name = ? AND timestamp = ?",
+                (rule_name, timestamp_text(output_timestamp)),
+            ).fetchone()
+            if row is None:
+                return []
+            outputs = db.execute(
+                "SELECT p.* FROM candidate_outputs co JOIN products p ON p.id = co.product_id "
+                "WHERE co.candidate_id = ? ORDER BY co.ordinal",
+                (row["id"],),
+            ).fetchall()
+        return [
+            Product(
+                item["product_code"],
+                parse_timestamp(item["timestamp"]),
+                item["path"],
+                item["id"],
+                item["version"],
+            )
+            for item in outputs
+        ]
 
     def candidate_inputs(self, rule_name: str, output_timestamp: datetime) -> list[Product]:
         with self._connect() as db:
