@@ -8,7 +8,11 @@ DATABASE = Path("pipeline.sqlite3")
 CONFIG = Path(__file__).with_name("pipeline.toml")
 
 
-def make_l2(inputs: list[Product], output_timestamp: datetime) -> str:
+def make_l2(*args: str | datetime) -> str:
+    output_timestamp = args[-1]
+    inputs = args[:-1]
+    if not isinstance(output_timestamp, datetime):
+        raise TypeError("the final processor argument must be the output timestamp")
     output = f"data/l2-{output_timestamp:%Y%m%dT%H%M%SZ}.fits"
     print(f"Creating {output} from {len(inputs)} inputs")
     # Call the scientific processing code here.

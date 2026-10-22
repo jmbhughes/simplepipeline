@@ -11,9 +11,24 @@ registered timestamps.
 
 Files are registered as timestamped, versioned products in SQLite. A configured
 worker watches for new inputs or follows a fixed interval, then applies each
-function's selection rule and calls its `module:function` processor. Successful
-outputs and their exact input provenance are recorded in the database; jobs
-without enough inputs are retried on later polls.
+function's selection rule and calls its `module:function` processor with the
+selected product paths as positional arguments, followed by the candidate
+timestamp. Paths are ordered by rule order in the TOML and by each rule's
+selection order. Successful outputs and their exact input provenance are
+recorded in the database; jobs without enough inputs are retried on later polls.
+
+For example, a function with a `same_timestamp` rule for `["RAW", "CAL"]`
+followed by a `latest_before` rule for `["REF"]` calls:
+
+```python
+process(raw_path, calibration_path, reference_path, output_timestamp)
+```
+
+The processor receives paths rather than `Product` objects. Use variadic
+positional parameters when the number of selected files varies, and treat the
+final argument as the candidate timestamp. The separate `discover_products`
+callback retains its `(inputs, output_timestamp)` signature, with `inputs` as a
+list of `Product` objects.
 
 When the processor can create a variable number of products, configure a
 separate `discover_products = "module:function"` callback. It receives the
@@ -115,10 +130,10 @@ The explanation is refreshed whenever the worker retries the candidate.
 
 The example [`pipeline.toml`](./pipeline.toml) configures an L2 function that
 creates an output at each registered L1 timestamp. Its processor,
-`demo:make_l2`, receives a list of input `Product` records and the candidate
-timestamp, writes the output, and returns its path. Processor references use
-`module:function`; the module must be importable from the configuration
-directory or Python environment.
+`demo:make_l2`, receives each selected input path as a positional argument,
+followed by the candidate timestamp, writes the output, and returns its path.
+Processor references use `module:function`; the module must be importable from
+the configuration directory or Python environment.
 
 Each function requires a `[functions.<name>.cadence]` table. The `type` can be:
 

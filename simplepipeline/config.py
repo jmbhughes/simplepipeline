@@ -32,7 +32,7 @@ from .rules import (
 
 
 LOGGER = logging.getLogger(__name__)
-Processor = Callable[[list[Product], datetime], object]
+Processor = Callable[..., object]
 ProductDiscovery = Callable[[list[Product], datetime], Iterable[Product]]
 
 
@@ -491,7 +491,10 @@ class ConfigWorker:
                     status = self.pipeline.run_candidate(
                         rule,
                         candidate_time,
-                        function.processor,
+                        lambda inputs, output_time: function.processor(
+                            *(product.path for product in inputs),
+                            output_time,
+                        ),
                         output_version=self.output_version,
                         product_discovery=function.product_discovery,
                         claim_timeout=self.claim_timeout,

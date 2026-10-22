@@ -48,6 +48,10 @@ def _worker_processor(inputs, output_time):
     return "/products/output.fits"
 
 
+def _configured_worker_processor(*args):
+    return "/products/output.fits"
+
+
 def _write_config(
     path,
     *,
@@ -443,8 +447,8 @@ def test_config_worker_triggers_when_registered_inputs_share_timestamp(
     caplog.set_level("INFO")
     calls = []
     processor_module = types.ModuleType("test_processors")
-    processor_module.process = lambda inputs, output_time: (
-        calls.append((inputs, output_time)) or "/products/output.fits"
+    processor_module.process = lambda *args: (
+        calls.append(args) or "/products/output.fits"
     )
     monkeypatch.setitem(sys.modules, "test_processors", processor_module)
     config_path = tmp_path / "pipeline.toml"
@@ -460,9 +464,8 @@ def test_config_worker_triggers_when_registered_inputs_share_timestamp(
     pipeline.add_product(Product("L1B", END, "/inputs/two"))
     assert worker.run_once(END) == {("combine", END): "complete"}
     assert len(calls) == 1
-    assert [(product.product_code, product.version) for product in calls[0][0]] == [
-        ("L1", "2.0.0"),
-        ("L1B", "0.0.0"),
+    assert calls == [
+        ("/inputs/one-v2", "/inputs/two", END)
     ]
     assert "Completed candidate combine at" in caplog.text
 
@@ -470,8 +473,8 @@ def test_config_worker_triggers_when_registered_inputs_share_timestamp(
 def test_config_worker_runs_and_persists_fixed_interval_schedule(tmp_path, monkeypatch):
     calls = []
     processor_module = types.ModuleType("test_processors")
-    processor_module.process = lambda inputs, output_time: (
-        calls.append(output_time) or f"/products/{output_time:%S}.fits"
+    processor_module.process = lambda *args: (
+        calls.append(args[-1]) or f"/products/{args[-1]:%S}.fits"
     )
     monkeypatch.setitem(sys.modules, "test_processors", processor_module)
     config_path = tmp_path / "pipeline.toml"
@@ -510,8 +513,8 @@ def test_config_worker_reads_max_attempts_from_toml(tmp_path, monkeypatch):
     calls = []
     processor_module = types.ModuleType("retry_processors")
 
-    def process(inputs, output_time):
-        calls.append(output_time)
+    def process(*args):
+        calls.append(args[-1])
         raise RuntimeError("temporary processor failure")
 
     processor_module.process = process
@@ -545,8 +548,8 @@ def test_config_worker_reads_max_attempts_from_toml(tmp_path, monkeypatch):
 def test_config_worker_combines_multiple_rules(tmp_path, monkeypatch):
     calls = []
     processor_module = types.ModuleType("test_processors")
-    processor_module.process = lambda inputs, output_time: (
-        calls.append(inputs) or "/products/output.fits"
+    processor_module.process = lambda *args: (
+        calls.append(args) or "/products/output.fits"
     )
     monkeypatch.setitem(sys.modules, "test_processors", processor_module)
     config_path = tmp_path / "pipeline.toml"
@@ -582,11 +585,12 @@ product = "L1"
     pipeline.add_product(Product("L1B", END - timedelta(seconds=1), "/inputs/l1b-late"))
 
     assert worker.run_once(END) == {("combine", END): "complete"}
-    assert [[product.path for product in inputs] for inputs in calls] == [[
+    assert calls == [(
         "/inputs/l1",
         "/inputs/l1b-early",
         "/inputs/l1b-late",
-    ]]
+        END,
+    )]
     assert [
         product.path for product in pipeline.candidate_inputs("combine", END)
     ] == [
@@ -599,8 +603,8 @@ product = "L1"
 def test_config_worker_uses_latest_before_rule(tmp_path, monkeypatch):
     calls = []
     processor_module = types.ModuleType("latest_before_processors")
-    processor_module.process = lambda inputs, output_time: (
-        calls.extend(inputs) or "/products/output.fits"
+    processor_module.process = lambda *args: (
+        calls.extend(args[:-1]) or "/products/output.fits"
     )
     monkeypatch.setitem(sys.modules, "latest_before_processors", processor_module)
     config_path = tmp_path / "pipeline.toml"
@@ -638,7 +642,7 @@ start_at = "{END.isoformat()}"
     pipeline.add_product(Product("REF", END, "/inputs/ref-at-output"))
 
     assert worker.run_once(END) == {("combine", END): "complete"}
-    assert [product.path for product in calls] == [
+    assert calls == [
         "/inputs/raw",
         "/inputs/ref-old",
     ]
@@ -650,8 +654,8 @@ def test_config_worker_discovers_products_without_declaring_output(
     calls = []
     processor_module = types.ModuleType("discovery_processors")
 
-    def process(inputs, output_time):
-        calls.append(("process", output_time))
+    def process(*args):
+        calls.append(("process", *args))
 
     def discover(inputs, output_time):
         calls.append(("discover", output_time))
@@ -684,7 +688,10 @@ product = "RAW"
     pipeline.add_product(Product("RAW", END, "/inputs/raw"))
 
     assert worker.run_once(END) == {("discovery", END): "complete"}
-    assert calls == [("process", END), ("discover", END)]
+    assert calls == [
+        ("process", "/inputs/raw", END),
+        ("discover", END),
+    ]
     assert [product.product_code for product in pipeline.candidate_outputs("discovery", END)] == [
         "CAL",
         "MASK",
@@ -694,8 +701,8 @@ product = "RAW"
 def test_config_worker_supports_random_distributed_window(tmp_path, monkeypatch):
     calls = []
     processor_module = types.ModuleType("random_processors")
-    processor_module.process = lambda inputs, output_time: (
-        calls.append(inputs) or "/products/output.fits"
+    processor_module.process = lambda *args: (
+        calls.append(args[:-1]) or "/products/output.fits"
     )
     monkeypatch.setitem(sys.modules, "random_processors", processor_module)
     config_path = tmp_path / "pipeline.toml"
@@ -727,15 +734,15 @@ start_at = "2026-10-16T00:00:00Z"
     assert worker.run_once(END) == {("random", END): "complete"}
     assert len(calls) == 1
     assert len(calls[0]) == 2
-    assert all(product.product_code == "L1" for product in calls[0])
+    assert all(isinstance(path, str) for path in calls[0])
 
 
 def test_sensor_cadence_registers_stable_files(tmp_path, monkeypatch):
     calls = []
     factory_calls = []
     processor_module = types.ModuleType("sensor_processors")
-    processor_module.process = lambda inputs, output_time: (
-        calls.append((inputs, output_time)) or "/products/output.fits"
+    processor_module.process = lambda *args: (
+        calls.append(args) or "/products/output.fits"
     )
 
     def product_from_path(path):
@@ -817,7 +824,8 @@ def test_concurrent_sensors_register_a_shared_file_once(tmp_path):
 
 def test_config_worker_runs_processor_in_a_separate_process(tmp_path):
     (tmp_path / "processor.py").write_text(
-        "def process(inputs, output_time):\n"
+        "def process(*args):\n"
+        "    output_time = args[-1]\n"
         "    return f'/products/{output_time:%Y%m%dT%H%M%SZ}.fits'\n"
     )
     config_path = tmp_path / "pipeline.toml"
@@ -843,7 +851,8 @@ def test_config_worker_runs_processor_in_a_separate_process(tmp_path):
 
 def test_config_worker_starts_configured_number_of_processes(tmp_path):
     (tmp_path / "processor.py").write_text(
-        "def process(inputs, output_time):\n"
+        "def process(*args):\n"
+        "    output_time = args[-1]\n"
         "    return f'/products/{output_time:%Y%m%dT%H%M%SZ}.fits'\n"
     )
     config_path = tmp_path / "pipeline.toml"
@@ -887,7 +896,7 @@ def test_config_worker_process_runs_to_completion(monkeypatch):
 
 def test_config_worker_run_forever_exits_when_stop_event_is_set(tmp_path, monkeypatch):
     processor_module = types.ModuleType("test_processors")
-    processor_module.process = _worker_processor
+    processor_module.process = _configured_worker_processor
     monkeypatch.setitem(sys.modules, "test_processors", processor_module)
     config_path = tmp_path / "pipeline.toml"
     _write_config(config_path, cadence='type = "on_input"\nproduct = "L1"')
@@ -913,7 +922,7 @@ def test_config_worker_run_forever_exits_when_stop_event_is_set(tmp_path, monkey
 
 def test_sensor_cadence_reports_missing_directory(tmp_path, monkeypatch):
     processor_module = types.ModuleType("sensor_processors")
-    processor_module.process = _worker_processor
+    processor_module.process = _configured_worker_processor
     processor_module.product_from_path = lambda path: Product("L1", END, str(path))
     monkeypatch.setitem(sys.modules, "sensor_processors", processor_module)
     missing = tmp_path / "not-created"
