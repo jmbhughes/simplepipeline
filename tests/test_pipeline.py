@@ -19,6 +19,7 @@ from simplepipeline import (
     ConfigWorker,
     DailyWorker,
     EvenlyDistributedWindowRule,
+    LatestBeforeRule,
     Pipeline,
     Product,
     RandomDistributedWindowRule,
@@ -243,6 +244,29 @@ def test_same_timestamp_rule_uses_latest_version_for_each_input_code():
         "/inputs/l1-new-at-end",
         "/inputs/l1b",
     ]
+
+
+def test_latest_before_rule_selects_highest_version_before_output_time():
+    rule = LatestBeforeRule("latest-reference", "REF", "L2")
+    highest_version = Product(
+        "REF", END - timedelta(days=1), "/inputs/newer-v9", version="9.0.0"
+    )
+    candidates = [
+        Product("REF", END - timedelta(days=2), "/inputs/old-v9", version="9.0.0"),
+        Product(
+            "REF",
+            END - timedelta(hours=1),
+            "/inputs/newer-v8",
+            version="8.0.0",
+        ),
+        highest_version,
+        Product("REF", END, "/inputs/exact"),
+        Product("REF", END + timedelta(hours=1), "/inputs/future"),
+        Product("OTHER", END - timedelta(minutes=1), "/inputs/other"),
+    ]
+
+    assert rule.select_inputs(candidates, END) == [highest_version]
+    assert rule.select_inputs([Product("REF", END, "/inputs/exact")], END) == []
 
 
 def test_existing_database_migrates_versions_without_losing_provenance(tmp_path):
@@ -568,6 +592,54 @@ product = "L1"
         "/inputs/l1",
         "/inputs/l1b-early",
         "/inputs/l1b-late",
+    ]
+
+
+def test_config_worker_uses_latest_before_rule(tmp_path, monkeypatch):
+    calls = []
+    processor_module = types.ModuleType("latest_before_processors")
+    processor_module.process = lambda inputs, output_time: (
+        calls.extend(inputs) or "/products/output.fits"
+    )
+    monkeypatch.setitem(sys.modules, "latest_before_processors", processor_module)
+    config_path = tmp_path / "pipeline.toml"
+    config_path.write_text(
+        f'''[worker]
+database = "worker.sqlite3"
+
+[functions.combine]
+output = "L2"
+processor = "latest_before_processors:process"
+
+[[functions.combine.rules]]
+type = "same_timestamp"
+inputs = ["RAW"]
+
+[[functions.combine.rules]]
+type = "latest_before"
+inputs = ["REF"]
+
+[functions.combine.cadence]
+type = "interval"
+every_seconds = 86400
+start_at = "{END.isoformat()}"
+'''
+    )
+    worker = ConfigWorker(config_path)
+    pipeline = Pipeline(tmp_path / "worker.sqlite3")
+    pipeline.add_product(Product("RAW", END, "/inputs/raw"))
+    pipeline.add_product(
+        Product("REF", END - timedelta(days=2), "/inputs/ref-old", version="9.0.0")
+    )
+    pipeline.add_product(
+        Product("REF", END - timedelta(days=1), "/inputs/ref-latest", version="1.0.0")
+    )
+    pipeline.add_product(Product("REF", END, "/inputs/ref-at-output"))
+
+    assert worker.run_once(END) == {("combine", END): "complete"}
+    assert [product.path for product in calls] == [
+        "/inputs/raw",
+        "/inputs/ref-old",
     ]
 
 

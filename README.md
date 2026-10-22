@@ -186,14 +186,27 @@ start_at = "2026-10-17T00:00:00Z"
 
 The existing single-rule configuration (`rule`, `inputs`, and any rule-specific
 settings directly under the function) remains supported. `same_timestamp` rules
-can require multiple input product codes at a matching timestamp, while
-`evenly_distributed_window` and `random_distributed_window` each accept one
-input product code plus a `window_seconds` and `count`. The evenly distributed
-rule chooses inputs near evenly spaced points in the window; the random rule
-chooses a random sample from all eligible inputs. Both use the interval
+can require multiple input product codes at a matching timestamp. The
+`latest_before` rule accepts one input product code and selects the product with
+the highest SemVer version strictly before the candidate timestamp. If multiple
+products have that version, it selects the one with the latest timestamp, then
+breaks ties by path and database ID. For example, add this to a function's
+`[[functions.<name>.rules]]` entries to require the highest-version calibration
+product from before each candidate:
+
+```toml
+[[functions.daily_l2.rules]]
+type = "latest_before"
+inputs = ["CAL"]
+```
+
+`evenly_distributed_window` and `random_distributed_window` each accept one input
+product code plus a `window_seconds` and `count`. The evenly distributed rule
+chooses inputs near evenly spaced points in the window; the random rule chooses
+a random sample from all eligible inputs. Both use the interval
 `[output timestamp - window_seconds, output timestamp)`, and remain pending
 until at least `count` eligible inputs are available. When registering files,
-pass `version="1.2.0"` to `Product`; the chooser
+pass `version="1.2.0"` to `Product`; window-rule selection
 ignores older versions for that product code, even if an older-version file has
 a timestamp that the newest version does not. Build metadata follows SemVer
 precedence and is used only to break ties deterministically. Single-path

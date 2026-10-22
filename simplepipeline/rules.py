@@ -10,8 +10,51 @@ from .models import (
     ScheduledRule,
     latest_version_products,
     normalize_timestamp,
+    semantic_version_key,
     validate_product_code,
 )
+
+
+class LatestBeforeRule(Rule):
+    """Select the highest-version input before the output time."""
+
+    def __init__(
+        self, name: str, input_product_code: str, output_product_code: str
+    ) -> None:
+        super().__init__(name, input_product_code, output_product_code)
+
+    def select_inputs(
+        self, candidates: Sequence[Product], output_timestamp: datetime
+    ) -> list[Product]:
+        target = normalize_timestamp(output_timestamp)
+        eligible = [
+            product
+            for product in candidates
+            if product.product_code == self.input_product_code
+            and product.timestamp < target
+        ]
+        if not eligible:
+            return []
+        highest_version = max(
+            (product.version for product in eligible),
+            key=semantic_version_key,
+        )
+        latest_timestamp = max(
+            product.timestamp
+            for product in eligible
+            if product.version == highest_version
+        )
+        return [
+            min(
+                (
+                    product
+                    for product in eligible
+                    if product.version == highest_version
+                    and product.timestamp == latest_timestamp
+                ),
+                key=lambda product: (product.path, product.product_id or 0),
+            )
+        ]
 
 
 class SameTimestampRule(Rule):

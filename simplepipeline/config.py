@@ -25,6 +25,7 @@ from .models import (
 from .rules import (
     CompositeRule,
     EvenlyDistributedWindowRule,
+    LatestBeforeRule,
     RandomDistributedWindowRule,
     SameTimestampRule,
 )
@@ -150,6 +151,12 @@ def _make_single_rule(
         raise ValueError(f"function {name!r} rule must declare a non-empty inputs array")
     if rule_type == "same_timestamp":
         return SameTimestampRule(name, input_codes, output_code)
+    if rule_type == "latest_before":
+        if len(input_codes) != 1:
+            raise ValueError(
+                f"function {name!r}: latest_before requires exactly one input"
+            )
+        return LatestBeforeRule(name, input_codes[0], output_code)
     if rule_type in ("evenly_distributed_window", "random_distributed_window"):
         if len(input_codes) != 1:
             raise ValueError(
@@ -170,7 +177,7 @@ def _make_single_rule(
         return rule_class(name, input_codes[0], output_code, window=window, count=count)
     raise ValueError(
         f"function {name!r} has unsupported rule {rule_type!r}; "
-        "use 'same_timestamp', 'evenly_distributed_window', "
+        "use 'same_timestamp', 'latest_before', 'evenly_distributed_window', "
         "or 'random_distributed_window'"
     )
 
