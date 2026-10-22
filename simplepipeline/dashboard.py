@@ -38,6 +38,7 @@ _DASHBOARD_HTML = """<!doctype html>
     .complete { color: #238636; }
     .failed { color: #cf222e; }
     .pending, .processing { color: #9a6700; }
+    td.pending-reason { min-width: 18rem; overflow-wrap: anywhere; }
   </style>
 </head>
 <body>
@@ -53,7 +54,7 @@ _DASHBOARD_HTML = """<!doctype html>
   <section>
     <h2>Recent candidates</h2>
     <div class="table-wrap"><table>
-      <thead><tr><th>Function</th><th>Output</th><th>Timestamp</th><th>Status</th><th>Attempts</th><th>Error</th></tr></thead>
+      <thead><tr><th>Function</th><th>Output</th><th>Timestamp</th><th>Status</th><th>Attempts</th><th>Waiting for</th><th>Error</th></tr></thead>
       <tbody id="candidates"></tbody>
     </table></div>
   </section>
@@ -113,6 +114,7 @@ _DASHBOARD_HTML = """<!doctype html>
           for (const value of [item.function, item.output, item.timestamp]) row.append(el("td", value));
           row.append(el("td", item.status, item.status));
           row.append(el("td", String(item.attempts)));
+          row.append(el("td", item.pending_reason, "pending-reason"));
           row.append(el("td", item.error, "error"));
           candidates.append(row);
         }
@@ -184,7 +186,7 @@ def read_dashboard_status(
         ).fetchall()
         candidates = connection.execute(
             "SELECT rule_name, output_product_code, timestamp, status, error, "
-            "claim_token, attempts FROM candidates"
+            "pending_reason, claim_token, attempts FROM candidates"
             f"{candidate_where} ORDER BY timestamp DESC, id DESC LIMIT 100",
             parameters,
         ).fetchall()
@@ -211,6 +213,7 @@ def read_dashboard_status(
                 "timestamp": row["timestamp"],
                 "status": "processing" if row["claim_token"] else row["status"],
                 "attempts": row["attempts"],
+                "pending_reason": row["pending_reason"] or "",
                 "error": row["error"] or "",
             }
             for row in candidates

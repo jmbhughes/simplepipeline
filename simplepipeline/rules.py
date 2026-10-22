@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import random
 from datetime import datetime, timedelta
-from typing import Sequence
+from typing import Callable, Sequence, cast
 
 from .models import (
     Product,
@@ -56,6 +56,16 @@ class LatestBeforeRule(Rule):
             )
         ]
 
+    def pending_reasons(
+        self, candidates: Sequence[Product], output_timestamp: datetime
+    ) -> list[str]:
+        if self.select_inputs(candidates, output_timestamp):
+            return []
+        return [
+            f"{self.name}: waiting for {self.input_product_code} before "
+            f"{normalize_timestamp(output_timestamp).isoformat()}"
+        ]
+
 
 class SameTimestampRule(Rule):
     """Select one input for each product code at the requested timestamp."""
@@ -101,6 +111,25 @@ class SameTimestampRule(Rule):
             )
         return selected
 
+    def pending_reasons(
+        self, candidates: Sequence[Product], output_timestamp: datetime
+    ) -> list[str]:
+        target = normalize_timestamp(output_timestamp)
+        available = latest_version_products(candidates)
+        missing = [
+            code
+            for code in self.input_product_codes
+            if not any(
+                product.product_code == code and product.timestamp == target
+                for product in available
+            )
+        ]
+        if not missing:
+            return []
+        return [
+            f"{self.name}: waiting for {', '.join(missing)} at {target.isoformat()}"
+        ]
+
 
 class EvenlyDistributedWindowRule(Rule):
     """Select exactly N inputs, as evenly distributed as possible in [T-window, T).
@@ -133,7 +162,8 @@ class EvenlyDistributedWindowRule(Rule):
         eligible = sorted(
             (
                 p for p in latest_version_products(candidates)
-                if start <= p.timestamp < end
+                if p.product_code == self.input_product_code
+                and start <= p.timestamp < end
             ),
             key=lambda p: (p.timestamp, p.path, p.product_id or 0),
         )
@@ -160,6 +190,25 @@ class EvenlyDistributedWindowRule(Rule):
             selected.append(eligible[best_index])
             used.add(best_index)
         return sorted(selected, key=lambda p: (p.timestamp, p.path, p.product_id or 0))
+
+    def pending_reasons(
+        self, candidates: Sequence[Product], output_timestamp: datetime
+    ) -> list[str]:
+        end = normalize_timestamp(output_timestamp)
+        start = end - self.window
+        eligible = [
+            product
+            for product in latest_version_products(candidates)
+            if product.product_code == self.input_product_code
+            and start <= product.timestamp < end
+        ]
+        if len(eligible) >= self.count:
+            return []
+        return [
+            f"{self.name}: waiting for {self.count - len(eligible)} more "
+            f"{self.input_product_code} product(s) in [{start.isoformat()}, "
+            f"{end.isoformat()}) ({len(eligible)}/{self.count} available)"
+        ]
 
 
 class RandomDistributedWindowRule(Rule):
@@ -210,6 +259,25 @@ class RandomDistributedWindowRule(Rule):
                 product.product_id or 0,
             ),
         )
+
+    def pending_reasons(
+        self, candidates: Sequence[Product], output_timestamp: datetime
+    ) -> list[str]:
+        end = normalize_timestamp(output_timestamp)
+        start = end - self.window
+        eligible = [
+            product
+            for product in latest_version_products(candidates)
+            if product.product_code == self.input_product_code
+            and start <= product.timestamp < end
+        ]
+        if len(eligible) >= self.count:
+            return []
+        return [
+            f"{self.name}: waiting for {self.count - len(eligible)} more "
+            f"{self.input_product_code} product(s) in [{start.isoformat()}, "
+            f"{end.isoformat()}) ({len(eligible)}/{self.count} available)"
+        ]
 
 
 class CompositeRule:
@@ -266,3 +334,22 @@ class CompositeRule:
                     selected.append(product)
                     seen.add(identity)
         return selected
+
+    def pending_reasons(
+        self, candidates: Sequence[Product], output_timestamp: datetime
+    ) -> list[str]:
+        reasons = []
+        for rule in self.rules:
+            if rule.select_inputs(candidates, output_timestamp):
+                continue
+            describe = getattr(rule, "pending_reasons", None)
+            if callable(describe):
+                reasons.extend(
+                    cast(
+                        Callable[[Sequence[Product], datetime], list[str]],
+                        describe,
+                    )(candidates, output_timestamp)
+                )
+            else:
+                reasons.append(f"{rule.name}: required inputs are not available")
+        return reasons

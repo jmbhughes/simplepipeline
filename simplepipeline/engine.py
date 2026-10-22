@@ -7,7 +7,7 @@ import time as time_module
 import uuid
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
-from typing import Callable, Iterable, Sequence
+from typing import Callable, Iterable, Sequence, cast
 
 from .models import (
     Product,
@@ -62,6 +62,7 @@ class Pipeline:
                     error TEXT,
                     claim_token TEXT,
                     claimed_at TEXT,
+                    pending_reason TEXT,
                     attempts INTEGER NOT NULL DEFAULT 0,
                     UNIQUE(rule_name, timestamp)
                 );
@@ -117,6 +118,8 @@ class Pipeline:
                 db.execute("ALTER TABLE candidates ADD COLUMN claim_token TEXT")
             if "claimed_at" not in candidate_columns:
                 db.execute("ALTER TABLE candidates ADD COLUMN claimed_at TEXT")
+            if "pending_reason" not in candidate_columns:
+                db.execute("ALTER TABLE candidates ADD COLUMN pending_reason TEXT")
             if "attempts" not in candidate_columns:
                 db.execute(
                     "ALTER TABLE candidates ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0"
@@ -263,7 +266,8 @@ class Pipeline:
                 if row["attempts"] >= max_attempts:
                     db.execute(
                         "UPDATE candidates SET status = 'failed', "
-                        "error = ?, claim_token = NULL, claimed_at = NULL WHERE id = ?",
+                        "error = ?, pending_reason = NULL, claim_token = NULL, "
+                        "claimed_at = NULL WHERE id = ?",
                         (
                             f"maximum attempts ({max_attempts}) reached after claim expired",
                             row["id"],
@@ -303,14 +307,26 @@ class Pipeline:
             ]
             selected = rule.select_inputs(available, output_timestamp)
             if not selected:
+                describe = getattr(rule, "pending_reasons", None)
+                reasons = (
+                    cast(
+                        Callable[[Sequence[Product], datetime], list[str]],
+                        describe,
+                    )(available, output_timestamp)
+                    if callable(describe)
+                    else [f"{rule.name}: required inputs are not available"]
+                )
                 db.execute(
-                    "UPDATE candidates SET status = 'pending', error = NULL, claim_token = NULL, claimed_at = NULL WHERE id = ?",
-                    (candidate_id,),
+                    "UPDATE candidates SET status = 'pending', error = NULL, "
+                    "pending_reason = ?, claim_token = NULL, claimed_at = NULL "
+                    "WHERE id = ?",
+                    ("; ".join(reasons), candidate_id),
                 )
                 return "pending"
 
             db.execute(
                 "UPDATE candidates SET status = 'pending', error = NULL, "
+                "pending_reason = NULL, "
                 "claim_token = ?, claimed_at = ?, attempts = attempts + 1 WHERE id = ?",
                 (claim_token, timestamp_text(claim_time), candidate_id),
             )
@@ -348,7 +364,9 @@ class Pipeline:
         except Exception as error:
             with self._connect() as db:
                 db.execute(
-                    "UPDATE candidates SET status = 'failed', error = ?, claim_token = NULL, claimed_at = NULL WHERE id = ? AND claim_token = ?",
+                    "UPDATE candidates SET status = 'failed', error = ?, "
+                    "pending_reason = NULL, claim_token = NULL, claimed_at = NULL "
+                    "WHERE id = ? AND claim_token = ?",
                     (str(error), candidate_id, claim_token),
                 )
             raise
@@ -407,14 +425,18 @@ class Pipeline:
                     [(candidate_id, product.product_id, i) for i, product in enumerate(selected)],
                 )
                 db.execute(
-                    "UPDATE candidates SET status = 'complete', output_product_id = ?, error = NULL, claim_token = NULL, claimed_at = NULL WHERE id = ?",
+                    "UPDATE candidates SET status = 'complete', output_product_id = ?, "
+                    "error = NULL, pending_reason = NULL, claim_token = NULL, "
+                    "claimed_at = NULL WHERE id = ?",
                     (output_ids[0] if output_ids else None, candidate_id),
                 )
                 return "complete"
         except Exception as error:
             with self._connect() as db:
                 db.execute(
-                    "UPDATE candidates SET status = 'failed', error = ?, claim_token = NULL, claimed_at = NULL WHERE id = ? AND claim_token = ?",
+                    "UPDATE candidates SET status = 'failed', error = ?, "
+                    "pending_reason = NULL, claim_token = NULL, claimed_at = NULL "
+                    "WHERE id = ? AND claim_token = ?",
                     (str(error), candidate_id, claim_token),
                 )
             raise

@@ -199,8 +199,14 @@ def _make_rule(
     for index, item in enumerate(rule_settings):
         if not isinstance(item, dict):
             raise ValueError(f"function {name!r} rule {index + 1} must be a table")
+        rule_type = item.get("type", "rule")
         rules.append(
-            _make_single_rule(name, item, item.get("type"), output_code)
+            _make_single_rule(
+                f"{name}[{index + 1}:{rule_type}]",
+                item,
+                rule_type,
+                output_code,
+            )
         )
     return CompositeRule(name, rules)
 

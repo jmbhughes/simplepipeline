@@ -114,6 +114,11 @@ class Rule:
     def select_inputs(self, candidates: Sequence[Product], output_timestamp: datetime) -> list[Product]:
         raise NotImplementedError
 
+    def pending_reasons(
+        self, candidates: Sequence[Product], output_timestamp: datetime
+    ) -> list[str]:
+        return [f"{self.name}: required inputs are not available"]
+
 
 class ScheduledRule(Protocol):
     name: str

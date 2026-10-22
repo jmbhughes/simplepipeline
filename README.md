@@ -108,6 +108,11 @@ and end time fields to filter candidate and product timestamps inclusively; leav
 either field blank for an open-ended range, or clear both to show all data.
 Times are entered in the browser's local timezone.
 
+Pending candidates include a **Waiting for** explanation. For composite rules,
+it identifies each unmet rule; same-timestamp rules list missing product codes,
+and window rules show how many eligible products are available versus required.
+The explanation is refreshed whenever the worker retries the candidate.
+
 The example [`pipeline.toml`](./pipeline.toml) configures an L2 function that
 creates an output at each registered L1 timestamp. Its processor,
 `demo:make_l2`, receives a list of input `Product` records and the candidate

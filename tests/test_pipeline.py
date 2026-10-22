@@ -980,9 +980,11 @@ def test_dashboard_serves_recent_pipeline_status(tmp_path, caplog):
         "pending",
     ]
     assert [item["attempts"] for item in status["candidates"]] == [1, 0]
+    assert "waiting for L1 at" in status["candidates"][1]["pending_reason"]
     assert status["products"][0]["product_code"] == "L2"
     assert "<title>simplepipeline dashboard</title>" in page
     assert 'id="start-time"' in page
+    assert "Waiting for" in page
     assert len(filtered_status["candidates"]) == 1
     assert filtered_status["candidates"][0]["timestamp"] == END.isoformat(
         timespec="microseconds"
@@ -1084,6 +1086,34 @@ def test_candidate_without_inputs_and_expired_claim_at_limit(tmp_path):
         max_attempts=1,
     ) == "failed"
     assert pipeline.candidate_status(rule.name, END + timedelta(seconds=1)) == "failed"
+
+
+def test_dashboard_pending_reason_names_unmet_composite_rule(tmp_path):
+    pipeline = Pipeline(tmp_path / "pipeline.sqlite3")
+    rule = rules_module.CompositeRule(
+        "combined",
+        [
+            SameTimestampRule("combined[1:same_timestamp]", "L1", "L2"),
+            EvenlyDistributedWindowRule(
+                "combined[2:evenly_distributed_window]",
+                "L1B",
+                "L2",
+                window=timedelta(days=1),
+                count=3,
+            ),
+        ],
+    )
+    pipeline.add_product(Product("L1", END, "/inputs/l1"))
+    pipeline.add_product(
+        Product("L1B", END - timedelta(hours=1), "/inputs/l1b-one")
+    )
+
+    assert pipeline.run_candidate(rule, END, _worker_processor) == "pending"
+    status = read_dashboard_status(pipeline.database)
+    pending_reason = status["candidates"][0]["pending_reason"]
+    assert "combined[2:evenly_distributed_window]" in pending_reason
+    assert "2 more L1B product(s)" in pending_reason
+    assert "combined[1:same_timestamp]" not in pending_reason
 
 
 def test_candidate_processor_empty_path_records_failure(tmp_path):
