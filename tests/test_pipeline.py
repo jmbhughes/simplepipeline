@@ -1,9 +1,10 @@
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 import json
 import runpy
 import sqlite3
 import sys
-from threading import Event, Thread
+from threading import Barrier, Event, Thread
 import time
 import types
 from urllib.error import HTTPError
@@ -787,6 +788,31 @@ extension = ".dat"
     assert restarted_worker.run_once(END) == {}
     assert restarted_worker.run_once(END) == {}
     assert factory_calls == [incoming_file]
+
+
+def test_concurrent_sensors_register_a_shared_file_once(tmp_path):
+    database = tmp_path / "pipeline.sqlite3"
+    sensor_path = tmp_path / "incoming" / "shared.dat"
+    sensor_path.parent.mkdir()
+    sensor_path.write_text("content")
+    pipelines = [Pipeline(database), Pipeline(database)]
+    products = [
+        Product("L1", END, str(sensor_path)),
+        Product("L1B", END, str(sensor_path)),
+    ]
+    start = Barrier(2)
+
+    def register(index):
+        start.wait()
+        return pipelines[index].register_sensor_product(
+            sensor_path, products[index]
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(register, range(2)))
+
+    assert sum(product is not None for product in results) == 1
+    assert len(pipelines[0].products()) == 1
 
 
 def test_config_worker_runs_processor_in_a_separate_process(tmp_path):

@@ -441,8 +441,13 @@ class ConfigWorker:
                         )
                         continue
                     product = function.product_factory(path)
-                    registered = self.pipeline.add_product(product)
+                    registered = self.pipeline.register_sensor_product(path, product)
                     self._sensor_registered_paths.add(key)
+                    if registered is None:
+                        LOGGER.debug(
+                            "Sensor file was registered by another worker: %s", path
+                        )
+                        continue
                     LOGGER.info(
                         "Registered sensor file %s as %s at %s",
                         path,

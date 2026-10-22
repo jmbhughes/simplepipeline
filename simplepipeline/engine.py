@@ -79,6 +79,10 @@ class Pipeline:
                     PRIMARY KEY(candidate_id, ordinal),
                     UNIQUE(candidate_id, product_id)
                 );
+                CREATE TABLE IF NOT EXISTS sensor_files (
+                    path TEXT PRIMARY KEY,
+                    product_id INTEGER NOT NULL REFERENCES products(id)
+                );
                 """
             )
             product_columns = {
@@ -126,33 +130,53 @@ class Pipeline:
     def add_product(self, product: Product) -> Product:
         created_at = timestamp_text(datetime.now(timezone.utc))
         with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            return self._add_product(db, product, created_at)
+
+    def register_sensor_product(
+        self, sensor_path: str | Path, product: Product
+    ) -> Product | None:
+        """Atomically register a sensor file once across concurrent workers."""
+        resolved_path = str(Path(sensor_path).expanduser().resolve())
+        created_at = timestamp_text(datetime.now(timezone.utc))
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
             existing = db.execute(
-                "SELECT id, path FROM products "
-                "WHERE product_code = ? AND timestamp = ? AND version = ?",
-                (
-                    product.product_code,
-                    timestamp_text(product.timestamp),
-                    product.version,
-                ),
+                "SELECT 1 FROM sensor_files WHERE path = ?", (resolved_path,)
             ).fetchone()
             if existing:
-                if existing["path"] != product.path:
-                    raise ValueError(
-                        f"product {product.product_code} at {timestamp_text(product.timestamp)} already exists at {existing['path']}"
-                    )
-                return Product(
-                    product.product_code,
-                    product.timestamp,
-                    product.path,
-                    existing["id"],
-                    product.version,
+                return None
+            registered = self._add_product(db, product, created_at)
+            db.execute(
+                "INSERT INTO sensor_files(path, product_id) VALUES (?, ?)",
+                (resolved_path, registered.product_id),
+            )
+            return registered
+
+    @staticmethod
+    def _add_product(
+        db: sqlite3.Connection, product: Product, created_at: str
+    ) -> Product:
+        timestamp = timestamp_text(product.timestamp)
+        existing = db.execute(
+            "SELECT id, path FROM products "
+            "WHERE product_code = ? AND timestamp = ? AND version = ?",
+            (product.product_code, timestamp, product.version),
+        ).fetchone()
+        if existing:
+            if existing["path"] != product.path:
+                raise ValueError(
+                    f"product {product.product_code} at {timestamp} "
+                    f"already exists at {existing['path']}"
                 )
+            product_id = int(existing["id"])
+        else:
             cursor = db.execute(
                 "INSERT INTO products(product_code, timestamp, path, version, created_at) "
                 "VALUES (?, ?, ?, ?, ?)",
                 (
                     product.product_code,
-                    timestamp_text(product.timestamp),
+                    timestamp,
                     product.path,
                     product.version,
                     created_at,

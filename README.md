@@ -163,6 +163,14 @@ Each function requires a `[functions.<name>.cadence]` table. The `type` can be:
   product = "L1"
   ```
 
+  Multiple workers or sensor configurations may watch the same directory.
+  Stable files are registered atomically in SQLite by resolved file path, so
+  only one sensor registers a given file even if workers observe it
+  simultaneously. When more than one sensor configuration matches a file, the
+  first successful registration determines its product metadata; use separate
+  directories or extensions when sensors need to classify overlapping files
+  differently.
+
 Cadence determines candidate output timestamps; rules determine which inputs
 are required for each candidate. All rules must select their inputs before the
 processor runs. For example, this interval-scheduled function requires an L1
