@@ -1,3 +1,4 @@
+import csv
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 import json
@@ -1632,6 +1633,47 @@ def test_config_worker_writes_resource_usage_csv(tmp_path, monkeypatch):
     assert csv_path.exists()
 
 
+def test_config_worker_writes_csv_metrics_row(tmp_path, monkeypatch):
+    module = types.ModuleType("test_processors")
+    module.process = _worker_processor
+    monkeypatch.setitem(sys.modules, "test_processors", module)
+    path = tmp_path / "resource_usage_csv.toml"
+    path.write_text(
+        '[worker]\nresource_usage_csv = "usage.csv"\n\n'
+        '[functions.combine]\n'
+        'inputs = ["L1", "L1B"]\n'
+        'output = "L2"\n'
+        'rule = "same_timestamp"\n'
+        'processor = "test_processors:process"\n\n'
+        '[functions.combine.cadence]\n'
+        'type = "on_input"\n'
+        'product = "L1"\n'
+    )
+    worker = ConfigWorker(path)
+    worker._write_resource_usage_csv(
+        "combine",
+        END,
+        "complete",
+        1.5,
+        512.0,
+        48.0,
+        64.0,
+    )
+    with open(worker.resource_usage_csv_path, newline="") as csv_file:
+        rows = list(csv.reader(csv_file))
+    assert rows[0] == [
+        "rule_name",
+        "candidate_time",
+        "status",
+        "cpu_seconds",
+        "max_rss_mib",
+        "current_python_mib",
+        "peak_python_mib",
+    ]
+    assert rows[1][0:3] == ["combine", timestamp_text(END), "complete"]
+    assert float(rows[1][3]) == 1.5
+
+
 @pytest.mark.parametrize(
     ("config_text", "message"),
     [
@@ -1658,6 +1700,14 @@ def test_config_worker_writes_resource_usage_csv(tmp_path, monkeypatch):
         (
             '[worker]\nclaim_timeout_seconds = 0\n' + _base_config_text(),
             "claim_timeout_seconds",
+        ),
+        (
+            '[worker]\nlog_resource_usage = "yes"\n' + _base_config_text(),
+            "log_resource_usage",
+        ),
+        (
+            '[worker]\nresource_usage_csv = 123\n' + _base_config_text(),
+            "resource_usage_csv",
         ),
         ("functions = []\n", "at least one"),
         ("[functions]\nf = 1\n", "must be a TOML table"),
