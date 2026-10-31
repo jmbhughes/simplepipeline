@@ -2118,3 +2118,102 @@ def test_processor_and_factory_references_are_validated(tmp_path, monkeypatch):
 def test_config_timestamp_parser_rejects_invalid_values(value, message):
     with pytest.raises(ValueError, match=message):
         config_module._parse_timestamp(value, "test timestamp")
+
+
+def test_latest_before_rule_reports_missing_input_and_composite_rule_validates_outputs():
+    rule = LatestBeforeRule("latest", "L1", "L2")
+    assert rule.pending_reasons([], END) == [
+        f"latest: waiting for L1 before {normalize_timestamp(END).isoformat()}"
+    ]
+    assert rule.pending_reasons(
+        [Product("L1", END - timedelta(minutes=1), "/inputs/one")], END
+    ) == []
+
+    with pytest.raises(ValueError, match="at least one rule is required"):
+        rules_module.CompositeRule("combined", [])
+    with pytest.raises(ValueError, match="same output product code"):
+        rules_module.CompositeRule(
+            "combined",
+            [
+                SameTimestampRule("first", "L1", "L2"),
+                SameTimestampRule("second", "L1", "L3"),
+            ],
+        )
+
+
+def test_pipeline_run_candidate_rejects_invalid_discovery_outputs(tmp_path):
+    pipeline = Pipeline(tmp_path / "pipeline.sqlite3")
+    rule = SameTimestampRule("discovery", "L1", "L2")
+    pipeline.add_product(Product("L1", END, "/inputs/one"))
+
+    def broken_discovery(inputs, output_time):
+        return [
+            Product("L2", output_time, "/outputs/one", version="1.0.0"),
+            Product("L2", output_time, "/outputs/two", version="1.0.0"),
+        ]
+
+    with pytest.raises(ValueError, match="duplicate product identities"):
+        pipeline.run_candidate(
+            rule,
+            END,
+            lambda inputs, output_time: "/products/output.fits",
+            product_discovery=broken_discovery,
+        )
+    assert pipeline.candidate_status("discovery", END) == "failed"
+
+
+def test_config_worker_registers_sensor_files_once_and_raises_for_missing_directory(
+    tmp_path, monkeypatch
+):
+    module = types.ModuleType("test_processors")
+    module.process = _worker_processor
+    module.product_from_path = lambda path: Product("L1", END, str(path))
+    monkeypatch.setitem(sys.modules, "test_processors", module)
+
+    incoming = tmp_path / "incoming"
+    incoming.mkdir()
+    file_path = incoming / "sample.txt"
+    file_path.write_text("payload")
+
+    config_path = tmp_path / "sensor.toml"
+    config_path.write_text(
+        '[worker]\ndatabase = "worker.sqlite3"\n\n'
+        '[functions.sensor]\n'
+        'inputs = ["L1"]\n'
+        'output = "L2"\n'
+        'rule = "same_timestamp"\n'
+        'processor = "test_processors:process"\n\n'
+        '[functions.sensor.cadence]\n'
+        'type = "sensor"\n'
+        'directory = "incoming"\n'
+        'product_factory = "test_processors:product_from_path"\n'
+        'extension = ".txt"\n'
+        'product = "L1"\n'
+    )
+
+    worker = ConfigWorker(config_path)
+    assert worker.run_once() == {}
+    assert not worker._sensor_registered_paths
+    assert worker.run_once() == {("sensor", END): "complete"}
+    assert len(worker.pipeline.products()) == 2
+    assert worker._sensor_registered_paths == {("sensor", str(file_path))}
+
+    missing_dir = tmp_path / "missing"
+    missing_path = tmp_path / "missing_sensor.toml"
+    missing_path.write_text(
+        '[worker]\ndatabase = "worker.sqlite3"\n\n'
+        '[functions.sensor]\n'
+        'inputs = ["L1"]\n'
+        'output = "L2"\n'
+        'rule = "same_timestamp"\n'
+        'processor = "test_processors:process"\n\n'
+        '[functions.sensor.cadence]\n'
+        'type = "sensor"\n'
+        'directory = "missing"\n'
+        'product_factory = "test_processors:product_from_path"\n'
+        'extension = ".txt"\n'
+        'product = "L1"\n'
+    )
+    missing_worker = ConfigWorker(missing_path)
+    with pytest.raises(NotADirectoryError, match="sensor directory does not exist"):
+        missing_worker.run_once()
