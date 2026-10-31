@@ -877,22 +877,100 @@ def test_config_worker_process_handles_keyboard_interrupt(monkeypatch):
     def interrupt(self, stop_event):
         raise KeyboardInterrupt
 
-    monkeypatch.setattr(ConfigWorker, "__init__", lambda self, config_path: None)
+    monkeypatch.setattr(
+        ConfigWorker,
+        "__init__",
+        lambda self, config_path, resource_usage=None, resource_usage_csv=None, resource_usage_interval_seconds=None: None,
+    )
     monkeypatch.setattr(ConfigWorker, "run_forever", interrupt)
     _run_config_process("unused.toml", None)
 
 
 def test_config_worker_process_runs_to_completion(monkeypatch):
-    calls = []
+    init_calls = []
+    run_calls = []
+
+    def __init__(
+        self,
+        config_path,
+        resource_usage=None,
+        resource_usage_csv=None,
+        resource_usage_interval_seconds=None,
+    ):
+        init_calls.append(
+            (config_path, resource_usage, resource_usage_csv, resource_usage_interval_seconds)
+        )
 
     def run_forever(self, stop_event):
-        calls.append(stop_event)
+        run_calls.append(stop_event)
 
-    monkeypatch.setattr(ConfigWorker, "__init__", lambda self, config_path: None)
+    monkeypatch.setattr(ConfigWorker, "__init__", __init__)
     monkeypatch.setattr(ConfigWorker, "run_forever", run_forever)
     event = object()
-    _run_config_process("unused.toml", event)
-    assert calls == [event]
+    _run_config_process(
+        "unused.toml",
+        event,
+        resource_usage=True,
+        resource_usage_csv="usage.csv",
+        resource_usage_interval_seconds=5.0,
+    )
+    assert init_calls == [("unused.toml", True, "usage.csv", 5.0)]
+    assert run_calls == [event]
+
+
+def test_config_worker_start_passes_resource_usage_settings_to_process(tmp_path, monkeypatch):
+    module = types.ModuleType("test_processors")
+    module.process = _worker_processor
+    monkeypatch.setitem(sys.modules, "test_processors", module)
+    path = tmp_path / "pipeline.toml"
+    path.write_text(
+        '[worker]\ndatabase = "worker.sqlite3"\nresource_usage_csv = "usage.csv"\n\n'
+        '[functions.combine]\n'
+        'inputs = ["L1"]\n'
+        'output = "L2"\n'
+        'rule = "same_timestamp"\n'
+        'processor = "test_processors:process"\n\n'
+        '[functions.combine.cadence]\n'
+        'type = "on_input"\n'
+        'product = "L1"\n'
+    )
+    worker = ConfigWorker(path)
+    captured = {}
+
+    class DummyEvent:
+        def is_set(self):
+            return False
+
+    class DummyProcess:
+        def __init__(self, target, args, name):
+            captured["target"] = target
+            captured["args"] = args
+            captured["name"] = name
+            self.pid = 1234
+
+        def start(self):
+            return None
+
+        def is_alive(self):
+            return False
+
+        def join(self, timeout=None):
+            return None
+
+    class DummyContext:
+        def Event(self):
+            return DummyEvent()
+
+        def Process(self, target, args, name):
+            return DummyProcess(target, args, name)
+
+    monkeypatch.setattr(config_module.multiprocessing, "get_context", lambda method: DummyContext())
+    worker.start()
+    assert captured["args"][0] == str(path)
+    assert captured["args"][1].is_set() is False
+    assert captured["args"][2] is True
+    assert captured["args"][3] == str(worker.resource_usage_csv_path)
+    assert captured["args"][4] == 0.0
 
 
 def test_config_worker_run_forever_exits_when_stop_event_is_set(tmp_path, monkeypatch):
@@ -948,6 +1026,54 @@ product_factory = "sensor_processors:product_from_path"
     )
     with pytest.raises(NotADirectoryError, match="sensor directory"):
         ConfigWorker(config_path).run_once(END)
+
+
+def test_candidate_timing_columns_are_persisted_and_dashboard_reports_average_runtime(
+    tmp_path,
+):
+    pipeline = Pipeline(tmp_path / "pipeline.sqlite3")
+    rule = SameTimestampRule("timed", "L1", "L2")
+    pipeline.add_product(Product("L1", END, "/inputs/data"))
+
+    assert (
+        pipeline.run_candidate(rule, END, lambda inputs, output_time: "/products/output.fits")
+        == "complete"
+    )
+
+    with sqlite3.connect(pipeline.database) as db:
+        db.row_factory = sqlite3.Row
+        row = db.execute(
+            "SELECT started_at, finished_at, duration_seconds FROM candidates WHERE rule_name = ?",
+            ("timed",),
+        ).fetchone()
+    assert row is not None
+    assert row["started_at"] is not None
+    assert row["finished_at"] is not None
+    assert row["duration_seconds"] is not None
+    assert row["duration_seconds"] >= 0
+
+    status = read_dashboard_status(pipeline.database)
+    assert status["runtime_summary"] == [
+        {
+            "rule_name": "timed",
+            "average_duration_seconds": round(float(row["duration_seconds"]), 3),
+            "run_count": 1,
+        }
+    ]
+
+
+def test_cli_export_timings_command_writes_csv(tmp_path):
+    pipeline = Pipeline(tmp_path / "pipeline.sqlite3")
+    rule = SameTimestampRule("timed", "L1", "L2")
+    pipeline.add_product(Product("L1", END, "/inputs/data"))
+    pipeline.run_candidate(rule, END, lambda inputs, output_time: "/products/output.fits")
+
+    output_path = tmp_path / "timings.csv"
+    exit_code = cli_module.main(["export-timings", str(pipeline.database), "--output", str(output_path)])
+    assert exit_code == 0
+    lines = output_path.read_text(encoding="utf-8").strip().splitlines()
+    assert lines[0].startswith("rule_name,output_product_code,timestamp,status,started_at")
+    assert "timed" in lines[1]
 
 
 def test_dashboard_serves_recent_pipeline_status(tmp_path, caplog):
@@ -1379,8 +1505,21 @@ def test_cli_main_resource_usage_flag(monkeypatch):
     class FakeWorker:
         database = "pipeline.sqlite3"
 
-        def __init__(self, config, resource_usage=None, resource_usage_csv=None):
-            calls.append((config, resource_usage, resource_usage_csv))
+        def __init__(
+            self,
+            config,
+            resource_usage=None,
+            resource_usage_csv=None,
+            resource_usage_interval_seconds=None,
+        ):
+            calls.append(
+                (
+                    config,
+                    resource_usage,
+                    resource_usage_csv,
+                    resource_usage_interval_seconds,
+                )
+            )
 
         def start(self):
             pass
@@ -1391,7 +1530,7 @@ def test_cli_main_resource_usage_flag(monkeypatch):
     monkeypatch.setattr(cli_module, "ConfigWorker", FakeWorker)
     monkeypatch.setattr(sys, "argv", ["simplepipeline", "pipeline.toml", "--resource-usage"])
     assert cli_module.main() == 0
-    assert calls == [("pipeline.toml", True, None)]
+    assert calls == [("pipeline.toml", True, None, None)]
 
 
 def test_cli_main_resource_usage_csv_flag(monkeypatch):
@@ -1400,8 +1539,21 @@ def test_cli_main_resource_usage_csv_flag(monkeypatch):
     class FakeWorker:
         database = "pipeline.sqlite3"
 
-        def __init__(self, config, resource_usage=None, resource_usage_csv=None):
-            calls.append((config, resource_usage, resource_usage_csv))
+        def __init__(
+            self,
+            config,
+            resource_usage=None,
+            resource_usage_csv=None,
+            resource_usage_interval_seconds=None,
+        ):
+            calls.append(
+                (
+                    config,
+                    resource_usage,
+                    resource_usage_csv,
+                    resource_usage_interval_seconds,
+                )
+            )
 
         def start(self):
             pass
@@ -1416,7 +1568,45 @@ def test_cli_main_resource_usage_csv_flag(monkeypatch):
         ["simplepipeline", "pipeline.toml", "--resource-usage-csv", "usage.csv"],
     )
     assert cli_module.main() == 0
-    assert calls == [("pipeline.toml", True, "usage.csv")]
+    assert calls == [("pipeline.toml", True, "usage.csv", None)]
+
+
+def test_cli_main_resource_usage_interval_flag(monkeypatch):
+    calls = []
+
+    class FakeWorker:
+        database = "pipeline.sqlite3"
+
+        def __init__(
+            self,
+            config,
+            resource_usage=None,
+            resource_usage_csv=None,
+            resource_usage_interval_seconds=None,
+        ):
+            calls.append(
+                (
+                    config,
+                    resource_usage,
+                    resource_usage_csv,
+                    resource_usage_interval_seconds,
+                )
+            )
+
+        def start(self):
+            pass
+
+        def join(self):
+            return 0
+
+    monkeypatch.setattr(cli_module, "ConfigWorker", FakeWorker)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["simplepipeline", "pipeline.toml", "--resource-usage-interval", "5"],
+    )
+    assert cli_module.main() == 0
+    assert calls == [("pipeline.toml", True, None, 5.0)]
 
 
 def test_cli_main_dashboard_verbose_and_keyboard_interrupt(monkeypatch):
@@ -1633,6 +1823,61 @@ def test_config_worker_writes_resource_usage_csv(tmp_path, monkeypatch):
     assert csv_path.exists()
 
 
+def test_config_worker_initializes_empty_resource_usage_csv(tmp_path, monkeypatch):
+    module = types.ModuleType("test_processors")
+    module.process = _worker_processor
+    monkeypatch.setitem(sys.modules, "test_processors", module)
+    path = tmp_path / "resource_usage_csv.toml"
+    path.write_text(
+        '[worker]\nresource_usage_csv = "usage.csv"\n\n'
+        '[functions.combine]\n'
+        'inputs = ["L1", "L1B"]\n'
+        'output = "L2"\n'
+        'rule = "same_timestamp"\n'
+        'processor = "test_processors:process"\n\n'
+        '[functions.combine.cadence]\n'
+        'type = "on_input"\n'
+        'product = "L1"\n'
+    )
+    csv_path = tmp_path / "usage.csv"
+    csv_path.write_text("")
+
+    worker = ConfigWorker(path)
+
+    with open(worker.resource_usage_csv_path, newline="") as csv_file:
+        rows = list(csv.reader(csv_file))
+    assert rows[0] == [
+        "rule_name",
+        "candidate_time",
+        "status",
+        "cpu_seconds",
+        "max_rss_mib",
+        "current_python_mib",
+        "peak_python_mib",
+    ]
+
+
+def test_config_worker_accepts_resource_usage_interval(tmp_path, monkeypatch):
+    module = types.ModuleType("test_processors")
+    module.process = _worker_processor
+    monkeypatch.setitem(sys.modules, "test_processors", module)
+    path = tmp_path / "resource_usage_interval.toml"
+    path.write_text(
+        '[worker]\nresource_usage_interval_seconds = 30\n\n'
+        '[functions.combine]\n'
+        'inputs = ["L1", "L1B"]\n'
+        'output = "L2"\n'
+        'rule = "same_timestamp"\n'
+        'processor = "test_processors:process"\n\n'
+        '[functions.combine.cadence]\n'
+        'type = "on_input"\n'
+        'product = "L1"\n'
+    )
+    worker = ConfigWorker(path)
+    assert worker.log_resource_usage is True
+    assert worker.resource_usage_log_interval_seconds == 30.0
+
+
 def test_config_worker_writes_csv_metrics_row(tmp_path, monkeypatch):
     module = types.ModuleType("test_processors")
     module.process = _worker_processor
@@ -1702,8 +1947,8 @@ def test_config_worker_writes_csv_metrics_row(tmp_path, monkeypatch):
             "claim_timeout_seconds",
         ),
         (
-            '[worker]\nlog_resource_usage = "yes"\n' + _base_config_text(),
-            "log_resource_usage",
+            '[worker]\nresource_usage = "yes"\n' + _base_config_text(),
+            "resource_usage",
         ),
         (
             '[worker]\nresource_usage_csv = 123\n' + _base_config_text(),

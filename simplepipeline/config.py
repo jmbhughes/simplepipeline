@@ -261,6 +261,7 @@ class ConfigWorker:
         *,
         resource_usage: bool | None = None,
         resource_usage_csv: str | Path | None = None,
+        resource_usage_interval_seconds: float | None = None,
     ) -> None:
         self.config_path = Path(config_path).expanduser().resolve()
         with self.config_path.open("rb") as config_file:
@@ -286,29 +287,52 @@ class ConfigWorker:
         )
         self.max_attempts = worker_settings.get("max_attempts", 3)
         self.max_workers = worker_settings.get("max_workers", 1)
-        configured_resource_usage = worker_settings.get(
-            "log_resource_usage",
-            worker_settings.get("resource_usage", False),
-        )
+        configured_resource_usage = worker_settings.get("resource_usage", False)
         if not isinstance(configured_resource_usage, bool):
-            raise ValueError("worker.log_resource_usage must be a boolean")
-        maybe_csv_path = worker_settings.get(
-            "log_resource_usage_csv",
-            worker_settings.get("resource_usage_csv"),
-        )
+            raise ValueError("worker.resource_usage must be a boolean")
+        maybe_csv_path = worker_settings.get("resource_usage_csv")
         if maybe_csv_path is not None and not isinstance(maybe_csv_path, str):
-            raise ValueError("worker.log_resource_usage_csv must be a path string")
+            raise ValueError("worker.resource_usage_csv must be a path string")
+        configured_resource_usage_interval = worker_settings.get(
+            "resource_usage_interval_seconds", 0
+        )
+        if isinstance(configured_resource_usage_interval, bool) or not isinstance(
+            configured_resource_usage_interval, (int, float)
+        ):
+            raise ValueError(
+                "worker.resource_usage_interval_seconds must be a non-negative number"
+            )
+        if configured_resource_usage_interval < 0:
+            raise ValueError(
+                "worker.resource_usage_interval_seconds must be a non-negative number"
+            )
         if resource_usage is not None and not isinstance(resource_usage, bool):
             raise ValueError("resource_usage must be a boolean")
+        if resource_usage_interval_seconds is not None:
+            if isinstance(resource_usage_interval_seconds, bool) or not isinstance(
+                resource_usage_interval_seconds, (int, float)
+            ):
+                raise ValueError(
+                    "resource_usage_interval_seconds must be a non-negative number"
+                )
+            if resource_usage_interval_seconds < 0:
+                raise ValueError(
+                    "resource_usage_interval_seconds must be a non-negative number"
+                )
         self.log_resource_usage = (
             configured_resource_usage if resource_usage is None else resource_usage
+        )
+        self.resource_usage_log_interval_seconds = (
+            float(configured_resource_usage_interval)
+            if resource_usage_interval_seconds is None
+            else float(resource_usage_interval_seconds)
         )
         self.resource_usage_csv_path = None
         if resource_usage_csv is not None:
             self.resource_usage_csv_path = _resolve_relative_path(resource_usage_csv, self.config_path.parent)
         elif maybe_csv_path is not None:
             self.resource_usage_csv_path = _resolve_relative_path(maybe_csv_path, self.config_path.parent)
-        if self.resource_usage_csv_path is not None:
+        if self.resource_usage_csv_path is not None or self.resource_usage_log_interval_seconds > 0:
             self.log_resource_usage = True
         if (
             isinstance(self.max_attempts, bool)
@@ -463,10 +487,11 @@ class ConfigWorker:
         self.pipeline = Pipeline(self.database)
         self._processes: list[multiprocessing.Process] = []
         self._stop_event = None
+        self._last_resource_usage_log_time: float | None = None
         if self.resource_usage_csv_path is not None:
             self.resource_usage_csv_path.parent.mkdir(parents=True, exist_ok=True)
             csv_path = self.resource_usage_csv_path
-            if not csv_path.exists():
+            if not csv_path.exists() or csv_path.stat().st_size == 0:
                 with csv_path.open("w", newline="") as csv_file:
                     writer = csv.writer(csv_file)
                     writer.writerow(
@@ -597,7 +622,15 @@ class ConfigWorker:
 
             for candidate_time in sorted(candidate_times):
                 start_usage = None
-                if self.log_resource_usage:
+                should_log_resource_usage = self.log_resource_usage and (
+                    self.resource_usage_log_interval_seconds <= 0
+                    or self._last_resource_usage_log_time is None
+                    or (
+                        time.monotonic() - self._last_resource_usage_log_time
+                        >= self.resource_usage_log_interval_seconds
+                    )
+                )
+                if should_log_resource_usage:
                     tracemalloc.start()
                     tracemalloc.reset_peak()
                     start_usage = _resource_snapshot()
@@ -638,7 +671,7 @@ class ConfigWorker:
                     )
                     status = "failed"
                 finally:
-                    if self.log_resource_usage and start_usage is not None:
+                    if should_log_resource_usage and start_usage is not None:
                         end_usage = _resource_snapshot()
                         cpu_seconds = max(
                             0.0, end_usage["cpu_seconds"] - start_usage["cpu_seconds"]
@@ -662,6 +695,7 @@ class ConfigWorker:
                             end_usage["current_python_mib"],
                             end_usage["peak_python_mib"],
                         )
+                        self._last_resource_usage_log_time = time.monotonic()
                         tracemalloc.stop()
                 if status == "complete":
                     LOGGER.info(
@@ -699,7 +733,15 @@ class ConfigWorker:
             for worker_number in range(1, self.max_workers + 1):
                 process = context.Process(
                     target=_run_config_process,
-                    args=(str(self.config_path), self._stop_event),
+                    args=(
+                        str(self.config_path),
+                        self._stop_event,
+                        self.log_resource_usage,
+                        str(self.resource_usage_csv_path)
+                        if self.resource_usage_csv_path is not None
+                        else None,
+                        self.resource_usage_log_interval_seconds,
+                    ),
                     name=f"simplepipeline-config-worker-{worker_number}",
                 )
                 process.start()
@@ -749,12 +791,23 @@ class ConfigWorker:
         )
 
 
-def _run_config_process(config_path: str, stop_event) -> None:
+def _run_config_process(
+    config_path: str,
+    stop_event,
+    resource_usage: bool | None = None,
+    resource_usage_csv: str | None = None,
+    resource_usage_interval_seconds: float | None = None,
+) -> None:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     try:
-        ConfigWorker(config_path).run_forever(stop_event)
+        ConfigWorker(
+            config_path,
+            resource_usage=resource_usage,
+            resource_usage_csv=resource_usage_csv,
+            resource_usage_interval_seconds=resource_usage_interval_seconds,
+        ).run_forever(stop_event)
     except KeyboardInterrupt:
         return

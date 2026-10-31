@@ -124,6 +124,14 @@ class Pipeline:
                 db.execute(
                     "ALTER TABLE candidates ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0"
                 )
+            if "started_at" not in candidate_columns:
+                db.execute("ALTER TABLE candidates ADD COLUMN started_at TEXT")
+            if "finished_at" not in candidate_columns:
+                db.execute("ALTER TABLE candidates ADD COLUMN finished_at TEXT")
+            if "duration_seconds" not in candidate_columns:
+                db.execute(
+                    "ALTER TABLE candidates ADD COLUMN duration_seconds REAL"
+                )
             db.execute(
                 "INSERT OR IGNORE INTO candidate_outputs(candidate_id, product_id, ordinal) "
                 "SELECT id, output_product_id, 0 FROM candidates "
@@ -327,8 +335,15 @@ class Pipeline:
             db.execute(
                 "UPDATE candidates SET status = 'pending', error = NULL, "
                 "pending_reason = NULL, "
-                "claim_token = ?, claimed_at = ?, attempts = attempts + 1 WHERE id = ?",
-                (claim_token, timestamp_text(claim_time), candidate_id),
+                "claim_token = ?, claimed_at = ?, started_at = ?, "
+                "finished_at = NULL, duration_seconds = NULL, "
+                "attempts = attempts + 1 WHERE id = ?",
+                (
+                    claim_token,
+                    timestamp_text(claim_time),
+                    timestamp_text(claim_time),
+                    candidate_id,
+                ),
             )
 
         try:
@@ -362,12 +377,30 @@ class Pipeline:
                     )
                 output_products = list(discovered)
         except Exception as error:
+            finished_at = datetime.now(timezone.utc)
             with self._connect() as db:
+                row = db.execute(
+                    "SELECT started_at FROM candidates WHERE id = ?",
+                    (candidate_id,),
+                ).fetchone()
+                duration = None
+                started_at = row["started_at"] if row and row["started_at"] else None
+                if started_at is not None:
+                    duration = max(
+                        0.0,
+                        (finished_at - parse_timestamp(started_at)).total_seconds(),
+                    )
                 db.execute(
                     "UPDATE candidates SET status = 'failed', error = ?, "
-                    "pending_reason = NULL, claim_token = NULL, claimed_at = NULL "
-                    "WHERE id = ? AND claim_token = ?",
-                    (str(error), candidate_id, claim_token),
+                    "pending_reason = NULL, claim_token = NULL, claimed_at = NULL, "
+                    "finished_at = ?, duration_seconds = ? WHERE id = ? AND claim_token = ?",
+                    (
+                        str(error),
+                        timestamp_text(finished_at),
+                        duration,
+                        candidate_id,
+                        claim_token,
+                    ),
                 )
             raise
 
@@ -424,20 +457,56 @@ class Pipeline:
                     "INSERT INTO candidate_inputs(candidate_id, product_id, ordinal) VALUES (?, ?, ?)",
                     [(candidate_id, product.product_id, i) for i, product in enumerate(selected)],
                 )
+                finished_at = datetime.now(timezone.utc)
+                row = db.execute(
+                    "SELECT started_at FROM candidates WHERE id = ?",
+                    (candidate_id,),
+                ).fetchone()
+                started_at = row["started_at"] if row and row["started_at"] else None
+                duration = None
+                if started_at is not None:
+                    duration = max(
+                        0.0,
+                        (finished_at - parse_timestamp(started_at)).total_seconds(),
+                    )
                 db.execute(
                     "UPDATE candidates SET status = 'complete', output_product_id = ?, "
                     "error = NULL, pending_reason = NULL, claim_token = NULL, "
-                    "claimed_at = NULL WHERE id = ?",
-                    (output_ids[0] if output_ids else None, candidate_id),
+                    "claimed_at = NULL, finished_at = ?, duration_seconds = ? "
+                    "WHERE id = ?",
+                    (
+                        output_ids[0] if output_ids else None,
+                        timestamp_text(finished_at),
+                        duration,
+                        candidate_id,
+                    ),
                 )
                 return "complete"
         except Exception as error:
+            finished_at = datetime.now(timezone.utc)
             with self._connect() as db:
+                row = db.execute(
+                    "SELECT started_at FROM candidates WHERE id = ?",
+                    (candidate_id,),
+                ).fetchone()
+                duration = None
+                started_at = row["started_at"] if row and row["started_at"] else None
+                if started_at is not None:
+                    duration = max(
+                        0.0,
+                        (finished_at - parse_timestamp(started_at)).total_seconds(),
+                    )
                 db.execute(
                     "UPDATE candidates SET status = 'failed', error = ?, "
-                    "pending_reason = NULL, claim_token = NULL, claimed_at = NULL "
-                    "WHERE id = ? AND claim_token = ?",
-                    (str(error), candidate_id, claim_token),
+                    "pending_reason = NULL, claim_token = NULL, claimed_at = NULL, "
+                    "finished_at = ?, duration_seconds = ? WHERE id = ? AND claim_token = ?",
+                    (
+                        str(error),
+                        timestamp_text(finished_at),
+                        duration,
+                        candidate_id,
+                        claim_token,
+                    ),
                 )
             raise
 
