@@ -1372,6 +1372,52 @@ def test_cli_main_without_dashboard(monkeypatch):
     assert calls == [("init", "pipeline.toml"), ("start",)]
 
 
+def test_cli_main_resource_usage_flag(monkeypatch):
+    calls = []
+
+    class FakeWorker:
+        database = "pipeline.sqlite3"
+
+        def __init__(self, config, resource_usage=None, resource_usage_csv=None):
+            calls.append((config, resource_usage, resource_usage_csv))
+
+        def start(self):
+            pass
+
+        def join(self):
+            return 0
+
+    monkeypatch.setattr(cli_module, "ConfigWorker", FakeWorker)
+    monkeypatch.setattr(sys, "argv", ["simplepipeline", "pipeline.toml", "--resource-usage"])
+    assert cli_module.main() == 0
+    assert calls == [("pipeline.toml", True, None)]
+
+
+def test_cli_main_resource_usage_csv_flag(monkeypatch):
+    calls = []
+
+    class FakeWorker:
+        database = "pipeline.sqlite3"
+
+        def __init__(self, config, resource_usage=None, resource_usage_csv=None):
+            calls.append((config, resource_usage, resource_usage_csv))
+
+        def start(self):
+            pass
+
+        def join(self):
+            return 0
+
+    monkeypatch.setattr(cli_module, "ConfigWorker", FakeWorker)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["simplepipeline", "pipeline.toml", "--resource-usage-csv", "usage.csv"],
+    )
+    assert cli_module.main() == 0
+    assert calls == [("pipeline.toml", True, "usage.csv")]
+
+
 def test_cli_main_dashboard_verbose_and_keyboard_interrupt(monkeypatch):
     calls = []
 
@@ -1541,6 +1587,49 @@ def _base_config_text():
 def test_rule_configuration_validation(settings, message):
     with pytest.raises(ValueError, match=message):
         config_module._make_rule("configured", settings)
+
+
+def test_config_worker_accepts_resource_usage_flag(tmp_path, monkeypatch):
+    module = types.ModuleType("test_processors")
+    module.process = _worker_processor
+    monkeypatch.setitem(sys.modules, "test_processors", module)
+    path = tmp_path / "resource_usage.toml"
+    path.write_text(
+        '[worker]\nresource_usage = true\n\n'
+        '[functions.combine]\n'
+        'inputs = ["L1", "L1B"]\n'
+        'output = "L2"\n'
+        'rule = "same_timestamp"\n'
+        'processor = "test_processors:process"\n\n'
+        '[functions.combine.cadence]\n'
+        'type = "on_input"\n'
+        'product = "L1"\n'
+    )
+    worker = ConfigWorker(path)
+    assert worker.log_resource_usage is True
+
+
+def test_config_worker_writes_resource_usage_csv(tmp_path, monkeypatch):
+    module = types.ModuleType("test_processors")
+    module.process = _worker_processor
+    monkeypatch.setitem(sys.modules, "test_processors", module)
+    csv_path = tmp_path / "usage.csv"
+    path = tmp_path / "resource_usage_csv.toml"
+    path.write_text(
+        '[worker]\nresource_usage_csv = "usage.csv"\n\n'
+        '[functions.combine]\n'
+        'inputs = ["L1", "L1B"]\n'
+        'output = "L2"\n'
+        'rule = "same_timestamp"\n'
+        'processor = "test_processors:process"\n\n'
+        '[functions.combine.cadence]\n'
+        'type = "on_input"\n'
+        'product = "L1"\n'
+    )
+    worker = ConfigWorker(path)
+    assert worker.resource_usage_csv_path == csv_path.resolve()
+    assert worker.log_resource_usage is True
+    assert csv_path.exists()
 
 
 @pytest.mark.parametrize(

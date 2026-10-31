@@ -108,6 +108,35 @@ polling candidates that are still waiting for inputs:
 python -m simplepipeline pipeline.toml --verbose
 ```
 
+Enable per-flow CPU and memory logging with either the CLI flag or a TOML
+setting:
+
+```sh
+python -m simplepipeline pipeline.toml --resource-usage
+```
+
+```toml
+[worker]
+log_resource_usage = true
+```
+
+The log includes each candidate's CPU time, peak Python memory, and process RSS
+for the flow that was just processed.
+
+Export the same metrics to CSV for later charting or analysis:
+
+```sh
+python -m simplepipeline pipeline.toml --resource-usage-csv pipeline-resource-usage.csv
+```
+
+```toml
+[worker]
+resource_usage_csv = "pipeline-resource-usage.csv"
+```
+
+The CSV contains one row per processed candidate with the rule name, candidate
+timestamp, status, CPU time, and memory measurements.
+
 To open a live browser dashboard showing recent candidates and products, start
 the worker with `--dashboard`:
 

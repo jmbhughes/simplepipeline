@@ -1,14 +1,22 @@
 from __future__ import annotations
 
+import csv
 import importlib
 import logging
 import multiprocessing
+import os
 import sys
 import time
+import tracemalloc
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Iterable, cast
+
+try:
+    import resource
+except ImportError:  # pragma: no cover - platform-specific
+    resource = None
 
 try:
     import tomllib
@@ -34,6 +42,38 @@ from .rules import (
 LOGGER = logging.getLogger(__name__)
 Processor = Callable[..., object]
 ProductDiscovery = Callable[[list[Product], datetime], Iterable[Product]]
+
+
+def _resolve_relative_path(path: str | os.PathLike[str], base_dir: Path) -> Path:
+    candidate = Path(path).expanduser()
+    if not candidate.is_absolute():
+        candidate = base_dir / candidate
+    return candidate.resolve()
+
+
+def _resource_snapshot() -> dict[str, float]:
+    cpu_seconds = 0.0
+    max_rss_mib = 0.0
+    current_python_mib = 0.0
+    peak_python_mib = 0.0
+    if resource is not None:
+        self_usage = resource.getrusage(resource.RUSAGE_SELF)
+        child_usage = resource.getrusage(resource.RUSAGE_CHILDREN)
+        cpu_seconds = self_usage.ru_utime + self_usage.ru_stime
+        cpu_seconds += child_usage.ru_utime + child_usage.ru_stime
+        max_rss_mib = self_usage.ru_maxrss / 1024.0
+        if sys.platform == "darwin":
+            max_rss_mib = self_usage.ru_maxrss / (1024.0 * 1024.0)
+    if tracemalloc.is_tracing():
+        current_python_bytes, peak_python_bytes = tracemalloc.get_traced_memory()
+        current_python_mib = current_python_bytes / (1024.0 * 1024.0)
+        peak_python_mib = peak_python_bytes / (1024.0 * 1024.0)
+    return {
+        "cpu_seconds": cpu_seconds,
+        "max_rss_mib": max_rss_mib,
+        "current_python_mib": current_python_mib,
+        "peak_python_mib": peak_python_mib,
+    }
 
 
 @dataclass(frozen=True)
@@ -214,7 +254,13 @@ def _make_rule(
 class ConfigWorker:
     """Run configured pipeline functions from a TOML file."""
 
-    def __init__(self, config_path: str | Path) -> None:
+    def __init__(
+        self,
+        config_path: str | Path,
+        *,
+        resource_usage: bool | None = None,
+        resource_usage_csv: str | Path | None = None,
+    ) -> None:
         self.config_path = Path(config_path).expanduser().resolve()
         with self.config_path.open("rb") as config_file:
             settings = tomllib.load(config_file)
@@ -239,6 +285,30 @@ class ConfigWorker:
         )
         self.max_attempts = worker_settings.get("max_attempts", 3)
         self.max_workers = worker_settings.get("max_workers", 1)
+        configured_resource_usage = worker_settings.get(
+            "log_resource_usage",
+            worker_settings.get("resource_usage", False),
+        )
+        if not isinstance(configured_resource_usage, bool):
+            raise ValueError("worker.log_resource_usage must be a boolean")
+        maybe_csv_path = worker_settings.get(
+            "log_resource_usage_csv",
+            worker_settings.get("resource_usage_csv"),
+        )
+        if maybe_csv_path is not None and not isinstance(maybe_csv_path, str):
+            raise ValueError("worker.log_resource_usage_csv must be a path string")
+        if resource_usage is not None and not isinstance(resource_usage, bool):
+            raise ValueError("resource_usage must be a boolean")
+        self.log_resource_usage = (
+            configured_resource_usage if resource_usage is None else resource_usage
+        )
+        self.resource_usage_csv_path = None
+        if resource_usage_csv is not None:
+            self.resource_usage_csv_path = _resolve_relative_path(resource_usage_csv, self.config_path.parent)
+        elif maybe_csv_path is not None:
+            self.resource_usage_csv_path = _resolve_relative_path(maybe_csv_path, self.config_path.parent)
+        if self.resource_usage_csv_path is not None:
+            self.log_resource_usage = True
         if (
             isinstance(self.max_attempts, bool)
             or not isinstance(self.max_attempts, int)
@@ -392,12 +462,55 @@ class ConfigWorker:
         self.pipeline = Pipeline(self.database)
         self._processes: list[multiprocessing.Process] = []
         self._stop_event = None
+        if self.resource_usage_csv_path is not None:
+            self.resource_usage_csv_path.parent.mkdir(parents=True, exist_ok=True)
+            csv_path = self.resource_usage_csv_path
+            if not csv_path.exists():
+                with csv_path.open("w", newline="") as csv_file:
+                    writer = csv.writer(csv_file)
+                    writer.writerow(
+                        [
+                            "rule_name",
+                            "candidate_time",
+                            "status",
+                            "cpu_seconds",
+                            "max_rss_mib",
+                            "current_python_mib",
+                            "peak_python_mib",
+                        ]
+                    )
         LOGGER.info(
             "Loaded %d pipeline function(s) from %s using database %s",
             len(self.functions),
             self.config_path,
             self.database,
         )
+
+    def _write_resource_usage_csv(
+        self,
+        rule_name: str,
+        candidate_time: datetime,
+        status: str,
+        cpu_seconds: float,
+        max_rss_mib: float,
+        current_python_mib: float,
+        peak_python_mib: float,
+    ) -> None:
+        if self.resource_usage_csv_path is None:
+            return
+        with self.resource_usage_csv_path.open("a", newline="") as csv_file:
+            writer = csv.writer(csv_file)
+            writer.writerow(
+                [
+                    rule_name,
+                    timestamp_text(candidate_time),
+                    status,
+                    f"{cpu_seconds:.6f}",
+                    f"{max_rss_mib:.6f}",
+                    f"{current_python_mib:.6f}",
+                    f"{peak_python_mib:.6f}",
+                ]
+            )
 
     def run_once(self, now: datetime | None = None) -> dict[tuple[str, datetime], str]:
         """Run due candidates and retry unfinished candidates."""
@@ -482,6 +595,11 @@ class ConfigWorker:
                     self.pipeline.set_scheduler_cursor(rule.name, cursor)
 
             for candidate_time in sorted(candidate_times):
+                start_usage = None
+                if self.log_resource_usage:
+                    tracemalloc.start()
+                    tracemalloc.reset_peak()
+                    start_usage = _resource_snapshot()
                 try:
                     LOGGER.debug(
                         "Processing candidate %s at %s",
@@ -518,6 +636,32 @@ class ConfigWorker:
                         retry_message,
                     )
                     status = "failed"
+                finally:
+                    if self.log_resource_usage and start_usage is not None:
+                        end_usage = _resource_snapshot()
+                        cpu_seconds = max(
+                            0.0, end_usage["cpu_seconds"] - start_usage["cpu_seconds"]
+                        )
+                        LOGGER.info(
+                            "Flow %s at %s used %.3f CPU seconds, max RSS %.2f MiB, "
+                            "Python current/peak %.2f/%.2f MiB",
+                            rule.name,
+                            candidate_time.isoformat(),
+                            cpu_seconds,
+                            end_usage["max_rss_mib"],
+                            end_usage["current_python_mib"],
+                            end_usage["peak_python_mib"],
+                        )
+                        self._write_resource_usage_csv(
+                            rule.name,
+                            candidate_time,
+                            status,
+                            cpu_seconds,
+                            end_usage["max_rss_mib"],
+                            end_usage["current_python_mib"],
+                            end_usage["peak_python_mib"],
+                        )
+                        tracemalloc.stop()
                 if status == "complete":
                     LOGGER.info(
                         "Completed candidate %s at %s",
