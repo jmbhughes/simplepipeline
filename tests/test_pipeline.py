@@ -2120,6 +2120,107 @@ def test_config_timestamp_parser_rejects_invalid_values(value, message):
         config_module._parse_timestamp(value, "test timestamp")
 
 
+def test_config_helper_functions_resolve_and_snapshot_resource_usage(monkeypatch, tmp_path):
+    assert config_module._resolve_relative_path("nested/output.csv", tmp_path) == (
+        tmp_path / "nested" / "output.csv"
+    ).resolve()
+
+    class FakeResource:
+        RUSAGE_SELF = 0
+        RUSAGE_CHILDREN = 1
+
+        def getrusage(self, value):
+            assert value in {self.RUSAGE_SELF, self.RUSAGE_CHILDREN}
+            return type(
+                "Usage",
+                (),
+                {"ru_utime": 1.5, "ru_stime": 2.5, "ru_maxrss": 1024},
+            )
+
+    class FakeTracemalloc:
+        @staticmethod
+        def is_tracing():
+            return True
+
+        @staticmethod
+        def get_traced_memory():
+            return (256 * 1024 * 1024, 512 * 1024 * 1024)
+
+    monkeypatch.setattr(config_module, "resource", FakeResource())
+    monkeypatch.setattr(config_module.sys, "platform", "darwin", raising=False)
+    monkeypatch.setattr(config_module, "tracemalloc", FakeTracemalloc)
+
+    snapshot = config_module._resource_snapshot()
+    assert snapshot["cpu_seconds"] == 8.0
+    assert snapshot["max_rss_mib"] == 0.0009765625
+    assert snapshot["current_python_mib"] == 256.0
+    assert snapshot["peak_python_mib"] == 512.0
+
+
+def test_config_reference_loaders_validate_inputs_and_outputs(monkeypatch, tmp_path):
+    module = types.ModuleType("config_loader_test")
+
+    def process(*args):
+        return "/products/output.fits"
+
+    def discover(inputs, output_time):
+        return [Product("L2", output_time, "/products/one.fits")]
+
+    def create(path):
+        return Product("L1", END, str(path))
+
+    module.process = process
+    module.discover = discover
+    module.create = create
+    monkeypatch.setitem(sys.modules, "config_loader_test", module)
+
+    assert config_module._load_processor("config_loader_test:process", tmp_path) is process
+    assert config_module._load_product_discovery("config_loader_test:discover", tmp_path) is discover
+    assert config_module._load_product_factory("config_loader_test:create", tmp_path)(tmp_path / "file.txt") == Product(
+        "L1", END, str(tmp_path / "file.txt")
+    )
+
+    with pytest.raises(ValueError, match="module:function"):
+        config_module._load_processor("missing-colon", tmp_path)
+    with pytest.raises(ValueError, match="invalid processor"):
+        config_module._load_processor(":process", tmp_path)
+    with pytest.raises(ValueError, match="does not identify a callable"):
+        config_module._load_processor("config_loader_test:missing", tmp_path)
+    with pytest.raises(ValueError, match="product discovery .* callable"):
+        config_module._load_product_discovery("config_loader_test:missing", tmp_path)
+    with pytest.raises(ValueError, match="product factory .* callable"):
+        config_module._load_product_factory("config_loader_test:missing", tmp_path)
+
+    module.bad_factory = lambda path: "not a Product"
+    with pytest.raises(TypeError, match="must return a Product"):
+        config_module._load_product_factory("config_loader_test:bad_factory", tmp_path)(tmp_path / "file.txt")
+
+
+def test_make_rule_accepts_dynamic_output_and_composite_rule_inputs():
+    dynamic = config_module._make_rule(
+        "dynamic",
+        {"inputs": ["L1"], "rule": "same_timestamp"},
+        dynamic_output=True,
+    )
+    assert dynamic.output_product_code == "dynamic"
+
+    composed = config_module._make_rule(
+        "combined",
+        {
+            "output": "L2",
+            "rules": [
+                {"type": "same_timestamp", "inputs": ["L1"], "output": "L2"},
+                {"type": "latest_before", "inputs": ["L1"], "output": "L2"},
+            ],
+        },
+    )
+    assert isinstance(composed, rules_module.CompositeRule)
+    assert [rule.name for rule in composed.rules] == ["combined[1:same_timestamp]", "combined[2:latest_before]"]
+
+    with pytest.raises(ValueError, match="must be a table"):
+        config_module._make_rule("bad", {"output": "L2", "rules": ["not a table"]})
+
+
 def test_latest_before_rule_reports_missing_input_and_composite_rule_validates_outputs():
     rule = LatestBeforeRule("latest", "L1", "L2")
     assert rule.pending_reasons([], END) == [
