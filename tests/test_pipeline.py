@@ -2118,3 +2118,203 @@ def test_processor_and_factory_references_are_validated(tmp_path, monkeypatch):
 def test_config_timestamp_parser_rejects_invalid_values(value, message):
     with pytest.raises(ValueError, match=message):
         config_module._parse_timestamp(value, "test timestamp")
+
+
+def test_config_helper_functions_resolve_and_snapshot_resource_usage(monkeypatch, tmp_path):
+    assert config_module._resolve_relative_path("nested/output.csv", tmp_path) == (
+        tmp_path / "nested" / "output.csv"
+    ).resolve()
+
+    class FakeResource:
+        RUSAGE_SELF = 0
+        RUSAGE_CHILDREN = 1
+
+        def getrusage(self, value):
+            assert value in {self.RUSAGE_SELF, self.RUSAGE_CHILDREN}
+            return type(
+                "Usage",
+                (),
+                {"ru_utime": 1.5, "ru_stime": 2.5, "ru_maxrss": 1024},
+            )
+
+    class FakeTracemalloc:
+        @staticmethod
+        def is_tracing():
+            return True
+
+        @staticmethod
+        def get_traced_memory():
+            return (256 * 1024 * 1024, 512 * 1024 * 1024)
+
+    monkeypatch.setattr(config_module, "resource", FakeResource())
+    monkeypatch.setattr(config_module.sys, "platform", "darwin", raising=False)
+    monkeypatch.setattr(config_module, "tracemalloc", FakeTracemalloc)
+
+    snapshot = config_module._resource_snapshot()
+    assert snapshot["cpu_seconds"] == 8.0
+    assert snapshot["max_rss_mib"] == 0.0009765625
+    assert snapshot["current_python_mib"] == 256.0
+    assert snapshot["peak_python_mib"] == 512.0
+
+
+def test_config_reference_loaders_validate_inputs_and_outputs(monkeypatch, tmp_path):
+    module = types.ModuleType("config_loader_test")
+
+    def process(*args):
+        return "/products/output.fits"
+
+    def discover(inputs, output_time):
+        return [Product("L2", output_time, "/products/one.fits")]
+
+    def create(path):
+        return Product("L1", END, str(path))
+
+    module.process = process
+    module.discover = discover
+    module.create = create
+    monkeypatch.setitem(sys.modules, "config_loader_test", module)
+
+    assert config_module._load_processor("config_loader_test:process", tmp_path) is process
+    assert config_module._load_product_discovery("config_loader_test:discover", tmp_path) is discover
+    assert config_module._load_product_factory("config_loader_test:create", tmp_path)(tmp_path / "file.txt") == Product(
+        "L1", END, str(tmp_path / "file.txt")
+    )
+
+    with pytest.raises(ValueError, match="module:function"):
+        config_module._load_processor("missing-colon", tmp_path)
+    with pytest.raises(ValueError, match="invalid processor"):
+        config_module._load_processor(":process", tmp_path)
+    with pytest.raises(ValueError, match="does not identify a callable"):
+        config_module._load_processor("config_loader_test:missing", tmp_path)
+    with pytest.raises(ValueError, match="product discovery .* callable"):
+        config_module._load_product_discovery("config_loader_test:missing", tmp_path)
+    with pytest.raises(ValueError, match="product factory .* callable"):
+        config_module._load_product_factory("config_loader_test:missing", tmp_path)
+
+    module.bad_factory = lambda path: "not a Product"
+    with pytest.raises(TypeError, match="must return a Product"):
+        config_module._load_product_factory("config_loader_test:bad_factory", tmp_path)(tmp_path / "file.txt")
+
+
+def test_make_rule_accepts_dynamic_output_and_composite_rule_inputs():
+    dynamic = config_module._make_rule(
+        "dynamic",
+        {"inputs": ["L1"], "rule": "same_timestamp"},
+        dynamic_output=True,
+    )
+    assert dynamic.output_product_code == "dynamic"
+
+    composed = config_module._make_rule(
+        "combined",
+        {
+            "output": "L2",
+            "rules": [
+                {"type": "same_timestamp", "inputs": ["L1"], "output": "L2"},
+                {"type": "latest_before", "inputs": ["L1"], "output": "L2"},
+            ],
+        },
+    )
+    assert isinstance(composed, rules_module.CompositeRule)
+    assert [rule.name for rule in composed.rules] == ["combined[1:same_timestamp]", "combined[2:latest_before]"]
+
+    with pytest.raises(ValueError, match="must be a table"):
+        config_module._make_rule("bad", {"output": "L2", "rules": ["not a table"]})
+
+
+def test_latest_before_rule_reports_missing_input_and_composite_rule_validates_outputs():
+    rule = LatestBeforeRule("latest", "L1", "L2")
+    assert rule.pending_reasons([], END) == [
+        f"latest: waiting for L1 before {normalize_timestamp(END).isoformat()}"
+    ]
+    assert rule.pending_reasons(
+        [Product("L1", END - timedelta(minutes=1), "/inputs/one")], END
+    ) == []
+
+    with pytest.raises(ValueError, match="at least one rule is required"):
+        rules_module.CompositeRule("combined", [])
+    with pytest.raises(ValueError, match="same output product code"):
+        rules_module.CompositeRule(
+            "combined",
+            [
+                SameTimestampRule("first", "L1", "L2"),
+                SameTimestampRule("second", "L1", "L3"),
+            ],
+        )
+
+
+def test_pipeline_run_candidate_rejects_invalid_discovery_outputs(tmp_path):
+    pipeline = Pipeline(tmp_path / "pipeline.sqlite3")
+    rule = SameTimestampRule("discovery", "L1", "L2")
+    pipeline.add_product(Product("L1", END, "/inputs/one"))
+
+    def broken_discovery(inputs, output_time):
+        return [
+            Product("L2", output_time, "/outputs/one", version="1.0.0"),
+            Product("L2", output_time, "/outputs/two", version="1.0.0"),
+        ]
+
+    with pytest.raises(ValueError, match="duplicate product identities"):
+        pipeline.run_candidate(
+            rule,
+            END,
+            lambda inputs, output_time: "/products/output.fits",
+            product_discovery=broken_discovery,
+        )
+    assert pipeline.candidate_status("discovery", END) == "failed"
+
+
+def test_config_worker_registers_sensor_files_once_and_raises_for_missing_directory(
+    tmp_path, monkeypatch
+):
+    module = types.ModuleType("test_processors")
+    module.process = _worker_processor
+    module.product_from_path = lambda path: Product("L1", END, str(path))
+    monkeypatch.setitem(sys.modules, "test_processors", module)
+
+    incoming = tmp_path / "incoming"
+    incoming.mkdir()
+    file_path = incoming / "sample.txt"
+    file_path.write_text("payload")
+
+    config_path = tmp_path / "sensor.toml"
+    config_path.write_text(
+        '[worker]\ndatabase = "worker.sqlite3"\n\n'
+        '[functions.sensor]\n'
+        'inputs = ["L1"]\n'
+        'output = "L2"\n'
+        'rule = "same_timestamp"\n'
+        'processor = "test_processors:process"\n\n'
+        '[functions.sensor.cadence]\n'
+        'type = "sensor"\n'
+        'directory = "incoming"\n'
+        'product_factory = "test_processors:product_from_path"\n'
+        'extension = ".txt"\n'
+        'product = "L1"\n'
+    )
+
+    worker = ConfigWorker(config_path)
+    assert worker.run_once() == {}
+    assert not worker._sensor_registered_paths
+    assert worker.run_once() == {("sensor", END): "complete"}
+    assert len(worker.pipeline.products()) == 2
+    assert worker._sensor_registered_paths == {("sensor", str(file_path))}
+
+    missing_dir = tmp_path / "missing"
+    missing_path = tmp_path / "missing_sensor.toml"
+    missing_path.write_text(
+        '[worker]\ndatabase = "worker.sqlite3"\n\n'
+        '[functions.sensor]\n'
+        'inputs = ["L1"]\n'
+        'output = "L2"\n'
+        'rule = "same_timestamp"\n'
+        'processor = "test_processors:process"\n\n'
+        '[functions.sensor.cadence]\n'
+        'type = "sensor"\n'
+        'directory = "missing"\n'
+        'product_factory = "test_processors:product_from_path"\n'
+        'extension = ".txt"\n'
+        'product = "L1"\n'
+    )
+    missing_worker = ConfigWorker(missing_path)
+    with pytest.raises(NotADirectoryError, match="sensor directory does not exist"):
+        missing_worker.run_once()
