@@ -1076,6 +1076,48 @@ def test_cli_export_timings_command_writes_csv(tmp_path):
     assert "timed" in lines[1]
 
 
+def test_cli_export_timings_prints_to_stdout_and_rejects_missing_columns(tmp_path, capsys):
+    pipeline = Pipeline(tmp_path / "pipeline.sqlite3")
+    rule = SameTimestampRule("timed", "L1", "L2")
+    pipeline.add_product(Product("L1", END, "/inputs/data"))
+    pipeline.run_candidate(rule, END, lambda inputs, output_time: "/products/output.fits")
+
+    exit_code = cli_module.main(["export-timings", str(pipeline.database)])
+    assert exit_code == 0
+    stdout = capsys.readouterr().out
+    assert "timed" in stdout
+
+    legacy = tmp_path / "legacy.sqlite3"
+    with sqlite3.connect(legacy) as db:
+        db.execute("CREATE TABLE candidates (rule_name TEXT)")
+
+    with pytest.raises(SystemExit):
+        cli_module.main(["export-timings", str(legacy)])
+
+
+def test_failed_candidates_record_started_and_finished_timestamps(tmp_path):
+    pipeline = Pipeline(tmp_path / "pipeline.sqlite3")
+    rule = SameTimestampRule("failed-timed", "L1", "L2")
+    pipeline.add_product(Product("L1", END, "/inputs/data"))
+
+    with pytest.raises(RuntimeError, match="boom"):
+        pipeline.run_candidate(rule, END, lambda inputs, output_time: (_ for _ in ()).throw(RuntimeError("boom")))
+
+    with sqlite3.connect(pipeline.database) as db:
+        db.row_factory = sqlite3.Row
+        row = db.execute(
+            "SELECT started_at, finished_at, duration_seconds, status FROM candidates WHERE rule_name = ?",
+            ("failed-timed",),
+        ).fetchone()
+
+    assert row is not None
+    assert row["status"] == "failed"
+    assert row["started_at"] is not None
+    assert row["finished_at"] is not None
+    assert row["duration_seconds"] is not None
+    assert row["duration_seconds"] >= 0
+
+
 def test_dashboard_serves_recent_pipeline_status(tmp_path, caplog):
     caplog.set_level("DEBUG", logger="simplepipeline.dashboard")
     pipeline = Pipeline(tmp_path / "pipeline.sqlite3")
