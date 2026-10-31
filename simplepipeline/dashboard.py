@@ -52,6 +52,13 @@ _DASHBOARD_HTML = """<!doctype html>
   </form>
   <div class="summary" id="summary"></div>
   <section>
+    <h2>Average runtime by rule</h2>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Rule</th><th>Average runtime (s)</th><th>Runs</th></tr></thead>
+      <tbody id="runtime-summary"></tbody>
+    </table></div>
+  </section>
+  <section>
     <h2>Recent candidates</h2>
     <div class="table-wrap"><table>
       <thead><tr><th>Function</th><th>Output</th><th>Timestamp</th><th>Status</th><th>Attempts</th><th>Waiting for</th><th>Error</th></tr></thead>
@@ -105,6 +112,16 @@ _DASHBOARD_HTML = """<!doctype html>
           const card = el("div", "", "card");
           card.append(el("strong", String(count)), el("span", label));
           summary.append(card);
+        }
+
+        const runtimeSummary = document.getElementById("runtime-summary");
+        runtimeSummary.replaceChildren();
+        for (const item of data.runtime_summary) {
+          const row = document.createElement("tr");
+          row.append(el("td", item.rule_name));
+          row.append(el("td", item.average_duration_seconds == null ? "—" : Number(item.average_duration_seconds).toFixed(3)));
+          row.append(el("td", String(item.run_count)));
+          runtimeSummary.append(row);
         }
 
         const candidates = document.getElementById("candidates");
@@ -173,6 +190,9 @@ def read_dashboard_status(
     candidate_where = (
         f" WHERE {' AND '.join(candidate_filters)}" if candidate_filters else ""
     )
+    candidate_time_predicate = (
+        f" AND {' AND '.join(candidate_filters)}" if candidate_filters else ""
+    )
     product_where = (
         f" WHERE {' AND '.join(product_filters)}" if product_filters else ""
     )
@@ -186,7 +206,8 @@ def read_dashboard_status(
         ).fetchall()
         candidates = connection.execute(
             "SELECT rule_name, output_product_code, timestamp, status, error, "
-            "pending_reason, claim_token, attempts FROM candidates"
+            "pending_reason, claim_token, attempts, started_at, finished_at, duration_seconds "
+            "FROM candidates"
             f"{candidate_where} ORDER BY timestamp DESC, id DESC LIMIT 100",
             parameters,
         ).fetchall()
@@ -194,6 +215,15 @@ def read_dashboard_status(
             "SELECT product_code, version, timestamp, path "
             f"FROM products{product_where} "
             "ORDER BY created_at DESC, id DESC LIMIT 100",
+            parameters,
+        ).fetchall()
+        runtime_summary = connection.execute(
+            "SELECT rule_name, ROUND(AVG(duration_seconds), 3) AS average_duration_seconds, "
+            "COUNT(*) AS run_count FROM candidates "
+            "WHERE status IN ('complete', 'failed') "
+            "AND duration_seconds IS NOT NULL"
+            f"{candidate_time_predicate} GROUP BY rule_name "
+            "ORDER BY average_duration_seconds DESC",
             parameters,
         ).fetchall()
 
@@ -206,6 +236,14 @@ def read_dashboard_status(
 
     return {
         "summary": summary,
+        "runtime_summary": [
+            {
+                "rule_name": row["rule_name"],
+                "average_duration_seconds": row["average_duration_seconds"],
+                "run_count": row["run_count"],
+            }
+            for row in runtime_summary
+        ],
         "candidates": [
             {
                 "function": row["rule_name"],
@@ -215,6 +253,9 @@ def read_dashboard_status(
                 "attempts": row["attempts"],
                 "pending_reason": row["pending_reason"] or "",
                 "error": row["error"] or "",
+                "started_at": row["started_at"],
+                "finished_at": row["finished_at"],
+                "duration_seconds": row["duration_seconds"],
             }
             for row in candidates
         ],

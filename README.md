@@ -108,6 +108,47 @@ polling candidates that are still waiting for inputs:
 python -m simplepipeline pipeline.toml --verbose
 ```
 
+Enable per-flow CPU and memory logging with either the CLI flag or a TOML
+setting. To reduce log volume, add a minimum interval between resource log
+entries:
+
+```sh
+python -m simplepipeline pipeline.toml --resource-usage --resource-usage-interval 60
+```
+
+```toml
+[worker]
+resource_usage = true
+resource_usage_interval_seconds = 60
+```
+
+The log includes each candidate's CPU time, peak Python memory, and process RSS
+for the flow that was just processed. With an interval of 0 (the default), the
+worker logs every processed flow; with a positive interval, it only logs after at
+least that many seconds have elapsed since the previous resource entry.
+
+Export the same metrics to CSV for later charting or analysis:
+
+```sh
+python -m simplepipeline pipeline.toml --resource-usage-csv pipeline-resource-usage.csv
+```
+
+```toml
+[worker]
+resource_usage_csv = "pipeline-resource-usage.csv"
+```
+
+The CSV contains one row per processed candidate with the rule name, candidate
+timestamp, status, CPU time, and memory measurements.
+
+Candidate execution timing is also stored in the SQLite `candidates` table as
+`started_at`, `finished_at`, and `duration_seconds`. Export those values to CSV
+for analysis with:
+
+```sh
+python -m simplepipeline export-timings pipeline.sqlite3 --output timings.csv
+```
+
 To open a live browser dashboard showing recent candidates and products, start
 the worker with `--dashboard`:
 
@@ -118,10 +159,11 @@ python -m simplepipeline pipeline.toml --dashboard
 The dashboard refreshes automatically at `http://127.0.0.1:8765`. Choose a
 different port with `--dashboard-port 9000`. It binds to localhost by default;
 to expose it to other machines, pass `--dashboard-host 0.0.0.0` and ensure the
-host firewall and network are appropriately restricted. Use the optional start
-and end time fields to filter candidate and product timestamps inclusively; leave
-either field blank for an open-ended range, or clear both to show all data.
-Times are entered in the browser's local timezone.
+host firewall and network are appropriately restricted. The dashboard also
+shows average runtime per rule for completed runs, and the optional start/end
+time fields filter candidate and product timestamps inclusively; leave either
+field blank for an open-ended range, or clear both to show all data. Times are
+entered in the browser's local timezone.
 
 Pending candidates include a **Waiting for** explanation. For composite rules,
 it identifies each unmet rule; same-timestamp rules list missing product codes,
